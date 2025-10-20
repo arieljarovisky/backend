@@ -1,0 +1,88 @@
+# ==========================================
+#  Node.js / Express backend
+# ==========================================
+
+# Dependencias
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+
+# Build / runtime
+dist/
+build/
+.cache/
+.tmp/
+coverage/
+.DS_Store
+
+# Archivos del entorno / configuración sensible
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+.env.test
+*.env
+
+# Archivos de logs
+logs/
+*.log
+*.log.*
+npm-debug.log*
+debug.log*
+error.log
+nohup.out
+
+# Archivos temporales del sistema
+*.swp
+*.swo
+*.tmp
+*.bak
+*.old
+
+# IDEs / Editores
+.vscode/
+.idea/
+*.iml
+
+# Archivos específicos de tu proyecto
+# (Ignoramos los archivos de configuración locales)
+src/helpers/session.json
+src/helpers/numbers.json
+
+# Archivos de base de datos locales
+*.sql
+*.sqlite
+*.db
+
+# Sistema de ngrok o túneles locales
+.ngrok2/
+ngrok.yml
+
+# Archivos generados por WhatsApp API o pruebas
+wa-logs/
+whatsapp_cache/
+sandbox_data.json
+
+# Archivos de uploads temporales
+uploads/
+temp/
+tmp/
+
+# ==========================================
+#  Sistema de turnos Peluquería específico
+# ==========================================
+# Configuración local o tokens
+pelu-turnos-credentials.json
+pelu-turnos-private/
+sandbox-test-data/
+
+# ==========================================
+#  SO / Misceláneos
+# ==========================================
+Thumbs.db
+ehthumbs.db
+desktop.ini

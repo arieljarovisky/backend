@@ -17,7 +17,7 @@ app.use(express.json());
 app.use("/api", customers);
 app.use("/api", health);
 app.use("/api", meta);
-app.use("/api", appointments);
+app.use("/api/appointments", appointments);
 app.use("/api", availability);
 app.use("/", waTest);
 app.use("/", whatsapp);

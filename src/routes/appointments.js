@@ -3,6 +3,7 @@ import { Router } from "express";
 import { pool } from "../db.js";
 import { addMinutes, isAfter, isBefore } from "date-fns";
 import { validateAppointmentDate } from "../helpers/dateValidation.js";
+import { checkAppointmentOverlap, parseDateTime, toMySQLDateTime } from "../helpers/overlapValidation.js";
 
 /* ================== Helpers de fecha ================== */
 function anyToMySQL(val) {
@@ -70,33 +71,6 @@ function insideWorkingHours(dateStr, start_time, end_time, start, end) {
   const dayStart = new Date(`${dateStr}T${start_time}`);
   const dayEnd = new Date(`${dateStr}T${end_time}`);
   return !isBefore(start, dayStart) && !isAfter(end, dayEnd);
-}
-
-/* ========= Overlaps ========= */
-async function hasOverlapDB({ stylistId, start, end, bufferMin = 0, excludingId = null }) {
-  const startWithBuffer = addMinutes(start, -bufferMin);
-  const endWithBuffer = addMinutes(end, bufferMin);
-
-  const paramsAppt = [stylistId, endWithBuffer, startWithBuffer];
-  let sqlAppt = `
-    SELECT 1
-      FROM appointment
-     WHERE stylist_id = ?
-       AND starts_at < ?
-       AND ends_at   > ?
-  `;
-  if (excludingId) { sqlAppt += " AND id <> ?"; paramsAppt.push(excludingId); }
-
-  const [appts] = await pool.query(sqlAppt, paramsAppt);
-  const [offs] = await pool.query(
-    `SELECT 1
-       FROM time_off
-      WHERE stylist_id = ?
-        AND starts_at < ?
-        AND ends_at   > ?`,
-    [stylistId, endWithBuffer, startWithBuffer]
-  );
-  return appts.length > 0 || offs.length > 0;
 }
 
 /* ========= Servicios / duración ========= */
@@ -194,10 +168,13 @@ export async function createAppointment({
       throw new Error("Fuera del horario laboral");
     }
 
-    const bufferMin = Number(process.env.APPT_BUFFER_MIN || 0);
-    if (await hasOverlapDB({ stylistId, start: startDate, end: endDate, bufferMin })) {
-      throw new Error("Horario no disponible (solapado o buffer)");
-    }
+    // ✅ VALIDACIÓN ROBUSTA DE OVERLAP
+    await checkAppointmentOverlap(conn, {
+      stylistId: Number(stylistId),
+      startTime: startDate,
+      endTime: endDate,
+      bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0)
+    });
 
     const [r] = await conn.query(
       `INSERT INTO appointment (customer_id, stylist_id, service_id, starts_at, ends_at, status, created_at)
@@ -256,6 +233,12 @@ appointments.post("/", async (req, res) => {
     durationMin
   } = req.body;
 
+  console.log("\n🆕 [POST /appointments] Nueva solicitud:");
+  console.log("   Phone:", customerPhone);
+  console.log("   Stylist:", stylistId);
+  console.log("   Service:", serviceId);
+  console.log("   StartsAt:", startsAt);
+
   if (!customerPhone || !stylistId || !serviceId || !startsAt) {
     return res.status(400).json({ ok: false, error: "Faltan campos requeridos" });
   }
@@ -271,10 +254,14 @@ appointments.post("/", async (req, res) => {
     startMySQL = anyToMySQL(startsAt);
     if (!startMySQL) throw new Error("Fecha/hora inválida");
 
+    console.log("   Fecha normalizada:", startMySQL);
+
     // ✅ VALIDAR FECHA ANTES DE TODO
     try {
       validateAppointmentDate(startMySQL);
+      console.log("   ✅ Validación de fecha OK");
     } catch (validationError) {
+      console.error("   ❌ Fecha inválida:", validationError.message);
       return res.status(400).json({
         ok: false,
         error: validationError.message
@@ -294,6 +281,8 @@ appointments.post("/", async (req, res) => {
       [normPhone(customerPhone)]
     );
     if (!cust) throw new Error("No se pudo obtener el cliente");
+
+    console.log("   ✅ Cliente:", cust.id);
 
     // Calcular fin si no viene
     endMySQL = anyToMySQL(endsAt);
@@ -316,6 +305,9 @@ appointments.post("/", async (req, res) => {
       endMySQL = anyToMySQL(calc_end);
     }
 
+    console.log("   Inicio:", startMySQL);
+    console.log("   Fin:", endMySQL);
+
     // Validar horarios de trabajo
     const dateStr = startMySQL.slice(0, 10);
     const wh = await getWorkingHoursForDate(stylistId, dateStr);
@@ -328,10 +320,25 @@ appointments.post("/", async (req, res) => {
       throw new Error("Fuera del horario laboral");
     }
 
-    // Validar solapamientos
-    const bufferMin = Number(process.env.APPT_BUFFER_MIN || 0);
-    if (await hasOverlapDB({ stylistId, start: startDate, end: endDate, bufferMin })) {
-      throw new Error("Ese horario se superpone con otro turno del mismo peluquero");
+    console.log("   ✅ Dentro del horario laboral");
+
+    // ✅ VALIDACIÓN ROBUSTA DE OVERLAP
+    try {
+      await checkAppointmentOverlap(conn, {
+        stylistId: Number(stylistId),
+        startTime: startDate,
+        endTime: endDate,
+        bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0)
+      });
+      console.log("   ✅ Sin overlaps");
+    } catch (overlapError) {
+      console.error("   ❌ Overlap detectado:", overlapError.message);
+      await conn.rollback();
+      conn.release();
+      return res.status(409).json({
+        ok: false,
+        error: overlapError.message
+      });
     }
 
     // Insertar turno
@@ -343,6 +350,8 @@ appointments.post("/", async (req, res) => {
     createdId = r.insertId;
 
     await conn.commit();
+    console.log("   ✅ Turno creado con ID:", createdId);
+    
     res.status(201).json({ ok: true, id: createdId });
 
     // WhatsApp en segundo plano (sin await)
@@ -360,14 +369,16 @@ appointments.post("/", async (req, res) => {
             `Peluquero/a: *${sty?.name || ""}*\n` +
             `Fecha: *${fecha} ${hora}*`;
           await sendWhatsAppText(cust.phone_e164, msg);
+          console.log("   📱 WhatsApp enviado");
         }
       } catch (waErr) {
-        console.warn("[WA] No se pudo enviar confirmación:", waErr?.message);
+        console.warn("   ⚠️  WA error:", waErr?.message);
       }
     });
 
   } catch (e) {
     await conn.rollback();
+    console.error("   ❌ Error general:", e.message);
     return res.status(400).json({ ok: false, error: e.message });
   } finally {
     conn.release();
@@ -379,6 +390,8 @@ appointments.put("/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const b = req.body || {};
+
+    console.log(`\n✏️  [PUT /appointments/${id}] Actualización:`);
 
     let newCustomerId = null;
     if (b.customerPhone || b.phone_e164) {
@@ -400,7 +413,9 @@ appointments.put("/:id", async (req, res) => {
     if (startMySQL) {
       try {
         validateAppointmentDate(startMySQL);
+        console.log("   ✅ Validación de fecha OK");
       } catch (validationError) {
+        console.error("   ❌ Fecha inválida:", validationError.message);
         return res.status(400).json({
           ok: false,
           error: validationError.message
@@ -422,7 +437,7 @@ appointments.put("/:id", async (req, res) => {
     }
 
     // Validar horarios si cambia rango/estilista
-    if (startMySQL && endMySQL) {
+    if (startMySQL && endMySQL && stylistId) {
       const dateStr = startMySQL.slice(0, 10);
       const wh = await getWorkingHoursForDate(stylistId, dateStr);
       if (!wh) return res.status(400).json({ ok: false, error: "El peluquero no tiene horarios definidos para ese día" });
@@ -434,8 +449,22 @@ appointments.put("/:id", async (req, res) => {
         return res.status(400).json({ ok: false, error: "Fuera del horario laboral" });
       }
 
-      if (stylistId && await hasOverlapDB({ stylistId: Number(stylistId), start: startDate, end: endDate, excludingId: id })) {
-        return res.status(409).json({ ok: false, error: "Ese horario se superpone con otro turno del mismo peluquero" });
+      // ✅ VALIDACIÓN DE OVERLAP (excluyendo este turno)
+      try {
+        await checkAppointmentOverlap(pool, {
+          stylistId: Number(stylistId),
+          startTime: startDate,
+          endTime: endDate,
+          excludeId: id, // ← Importante: excluir el turno que estamos editando
+          bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0)
+        });
+        console.log("   ✅ Sin overlaps");
+      } catch (overlapError) {
+        console.error("   ❌ Overlap:", overlapError.message);
+        return res.status(409).json({
+          ok: false,
+          error: overlapError.message
+        });
       }
     }
 
@@ -451,9 +480,15 @@ appointments.put("/:id", async (req, res) => {
       [newCustomerId, stylistId, serviceId, startMySQL, endMySQL, status, id]
     );
 
-    if (r.affectedRows === 0) return res.status(404).json({ ok: false, error: "Turno no encontrado" });
+    if (r.affectedRows === 0) {
+      console.error("   ❌ Turno no encontrado");
+      return res.status(404).json({ ok: false, error: "Turno no encontrado" });
+    }
+
+    console.log("   ✅ Turno actualizado");
     res.json({ ok: true });
   } catch (e) {
+    console.error("   ❌ Error:", e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
@@ -462,10 +497,19 @@ appointments.put("/:id", async (req, res) => {
 appointments.delete("/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    console.log(`\n🗑️  [DELETE /appointments/${id}]`);
+    
     const [r] = await pool.query(`DELETE FROM appointment WHERE id=?`, [id]);
-    if (r.affectedRows === 0) return res.status(404).json({ ok: false, error: "Turno no encontrado" });
+    
+    if (r.affectedRows === 0) {
+      console.error("   ❌ Turno no encontrado");
+      return res.status(404).json({ ok: false, error: "Turno no encontrado" });
+    }
+    
+    console.log("   ✅ Turno eliminado");
     res.json({ ok: true });
   } catch (e) {
+    console.error("   ❌ Error:", e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });

@@ -57,22 +57,20 @@ export function isBusinessDay(datetime) {
  * @param {string} startsAt - Formato "YYYY-MM-DD HH:MM:SS"
  * @throws {Error} si la validación falla
  */
-export function validateAppointmentDate(startsAt) {
-    if (!startsAt) {
-        throw new Error("Fecha de inicio requerida");
+export function validateAppointmentDate(mysqlDateTime) {
+    // mysqlDateTime: "YYYY-MM-DD HH:MM:SS"
+    const d = new Date(mysqlDateTime.replace(" ", "T"));
+    if (Number.isNaN(d.getTime())) {
+        throw new Error("Fecha/hora inválida");
     }
 
-    if (isPastDateTime(startsAt)) {
-        throw new Error("No podés agendar turnos en el pasado");
+    // No permitir fechas en el pasado (con 1 minuto de tolerancia)
+    const now = new Date(Date.now() - 60_000);
+    if (d < now) {
+        throw new Error("La fecha/hora debe ser futura");
     }
 
-    if (!isWithinAllowedRange(startsAt)) {
-        throw new Error("La fecha debe estar dentro de los próximos 90 días");
-    }
-
-    if (!isBusinessDay(startsAt)) {
-        throw new Error("No trabajamos los domingos");
-    }
-
-    return true;
+    // (Opcional) validar minutos en múltiplos de 5/10/15
+    const minutes = d.getMinutes();
+    if (minutes % 5 !== 0) throw new Error("La hora debe ser en bloques de 5 minutos");
 }

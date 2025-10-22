@@ -9,5 +9,5 @@ export const pool = createPool({
   database: process.env.DB_NAME,
   waitForConnections: true,
   connectionLimit: 10,
-  timezone: "Z" // guardamos en UTC
+ timezone: "-03:00" // guardamos en hora local Argentina
 });

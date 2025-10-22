@@ -2,6 +2,7 @@
 import { Router } from "express";
 import { pool } from "../db.js";
 import { addMinutes, isAfter, isBefore } from "date-fns";
+import { validateAppointmentDate } from "../helpers/dateValidation.js";
 
 /* ================== Helpers de fecha ================== */
 function anyToMySQL(val) {
@@ -108,7 +109,7 @@ async function resolveServiceDuration(serviceId, fallbackDurationMin) {
       );
       if (row && row.duration_min != null) return Number(row.duration_min);
     }
-  } catch {}
+  } catch { }
   return fallbackDurationMin != null ? Number(fallbackDurationMin) : null;
 }
 
@@ -135,7 +136,7 @@ let sendWhatsAppText = null;
 try {
   const m = await import("../whatsapp.js");
   sendWhatsAppText = m.sendWhatsAppText || m.waSendText || null;
-} catch {}
+} catch { }
 
 /* ========= Servicio programático (opcional) ========= */
 // Útil si lo querés invocar desde otro módulo
@@ -267,21 +268,34 @@ appointments.post("/", async (req, res) => {
   try {
     await conn.beginTransaction();
 
+    startMySQL = anyToMySQL(startsAt);
+    if (!startMySQL) throw new Error("Fecha/hora inválida");
+
+    // ✅ VALIDAR FECHA ANTES DE TODO
+    try {
+      validateAppointmentDate(startMySQL);
+    } catch (validationError) {
+      return res.status(400).json({
+        ok: false,
+        error: validationError.message
+      });
+    }
+
+    // Upsert cliente
     await conn.query(
       `INSERT INTO customer (name, phone_e164)
        VALUES (?, ?)
        ON DUPLICATE KEY UPDATE name = COALESCE(VALUES(name), name)`,
       [customerName ?? null, normPhone(customerPhone)]
     );
+
     const [[cust]] = await conn.query(
       `SELECT id, name, phone_e164 FROM customer WHERE phone_e164=? LIMIT 1`,
       [normPhone(customerPhone)]
     );
     if (!cust) throw new Error("No se pudo obtener el cliente");
 
-    startMySQL = anyToMySQL(startsAt);
-    if (!startMySQL) throw new Error("Fecha/hora inválida");
-
+    // Calcular fin si no viene
     endMySQL = anyToMySQL(endsAt);
     if (!endMySQL) {
       let dur = null;
@@ -291,7 +305,7 @@ appointments.post("/", async (req, res) => {
           [serviceId]
         );
         if (row && row.duration_min != null) dur = Number(row.duration_min);
-      } catch {}
+      } catch { }
       if (dur == null && durationMin != null) dur = Number(durationMin);
       if (!dur) throw new Error("No se pudo determinar la duración del servicio");
 
@@ -302,21 +316,25 @@ appointments.post("/", async (req, res) => {
       endMySQL = anyToMySQL(calc_end);
     }
 
+    // Validar horarios de trabajo
     const dateStr = startMySQL.slice(0, 10);
     const wh = await getWorkingHoursForDate(stylistId, dateStr);
     if (!wh) throw new Error("El peluquero no tiene horarios definidos para ese día");
 
     const startDate = new Date(startMySQL.replace(" ", "T"));
     const endDate = new Date(endMySQL.replace(" ", "T"));
+
     if (!insideWorkingHours(dateStr, wh.start_time, wh.end_time, startDate, endDate)) {
       throw new Error("Fuera del horario laboral");
     }
 
+    // Validar solapamientos
     const bufferMin = Number(process.env.APPT_BUFFER_MIN || 0);
     if (await hasOverlapDB({ stylistId, start: startDate, end: endDate, bufferMin })) {
       throw new Error("Ese horario se superpone con otro turno del mismo peluquero");
     }
 
+    // Insertar turno
     const [r] = await conn.query(
       `INSERT INTO appointment (customer_id, stylist_id, service_id, starts_at, ends_at, status, created_at)
        VALUES (?, ?, ?, ?, ?, ?, NOW())`,
@@ -325,11 +343,9 @@ appointments.post("/", async (req, res) => {
     createdId = r.insertId;
 
     await conn.commit();
-
-    // responder ya
     res.status(201).json({ ok: true, id: createdId });
 
-    // WhatsApp best-effort
+    // WhatsApp en segundo plano (sin await)
     queueMicrotask(async () => {
       try {
         const [[srv]] = await pool.query("SELECT name FROM service WHERE id=?", [serviceId]);
@@ -337,7 +353,7 @@ appointments.post("/", async (req, res) => {
         if (sendWhatsAppText) {
           const d = new Date(startMySQL.replace(" ", "T"));
           const fecha = d.toLocaleDateString("es-AR", { weekday: "short", day: "2-digit", month: "2-digit" });
-          const hora  = d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
+          const hora = d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
           const msg =
             `¡Turno reservado! ✅\n` +
             `Servicio: *${srv?.name || ""}*\n` +
@@ -364,7 +380,6 @@ appointments.put("/:id", async (req, res) => {
     const { id } = req.params;
     const b = req.body || {};
 
-    // re-asignar cliente por teléfono (opcional)
     let newCustomerId = null;
     if (b.customerPhone || b.phone_e164) {
       newCustomerId = await ensureCustomerId({
@@ -373,15 +388,27 @@ appointments.put("/:id", async (req, res) => {
       });
     }
 
-    const stylistId  = b.stylistId  ?? b.stylist_id  ?? null;
-    const serviceId  = b.serviceId  ?? b.service_id  ?? null;
-    const status     = b.status     ?? null;
-    const durationMin= b.durationMin?? null;
+    const stylistId = b.stylistId ?? b.stylist_id ?? null;
+    const serviceId = b.serviceId ?? b.service_id ?? null;
+    const status = b.status ?? null;
+    const durationMin = b.durationMin ?? null;
 
     let startMySQL = anyToMySQL(b.startsAt ?? b.starts_at);
-    let endMySQL   = anyToMySQL(b.endsAt   ?? b.ends_at);
+    let endMySQL = anyToMySQL(b.endsAt ?? b.ends_at);
 
-    // calcular fin si no vino y tenemos inicio + duración
+    // ✅ VALIDAR si se modifica la fecha
+    if (startMySQL) {
+      try {
+        validateAppointmentDate(startMySQL);
+      } catch (validationError) {
+        return res.status(400).json({
+          ok: false,
+          error: validationError.message
+        });
+      }
+    }
+
+    // Calcular fin si no vino y tenemos inicio + duración
     if (!endMySQL && (startMySQL || serviceId || durationMin != null)) {
       const dur = await resolveServiceDuration(serviceId, durationMin);
       if (!dur || !startMySQL) {
@@ -394,14 +421,14 @@ appointments.put("/:id", async (req, res) => {
       endMySQL = anyToMySQL(calc_end);
     }
 
-    // validaciones si cambia rango/estilista
+    // Validar horarios si cambia rango/estilista
     if (startMySQL && endMySQL) {
       const dateStr = startMySQL.slice(0, 10);
       const wh = await getWorkingHoursForDate(stylistId, dateStr);
       if (!wh) return res.status(400).json({ ok: false, error: "El peluquero no tiene horarios definidos para ese día" });
 
       const startDate = new Date(startMySQL.replace(" ", "T"));
-      const endDate   = new Date(endMySQL.replace(" ", "T"));
+      const endDate = new Date(endMySQL.replace(" ", "T"));
 
       if (!insideWorkingHours(dateStr, wh.start_time, wh.end_time, startDate, endDate)) {
         return res.status(400).json({ ok: false, error: "Fuera del horario laboral" });

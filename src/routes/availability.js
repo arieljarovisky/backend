@@ -1,33 +1,22 @@
 // src/routes/availability.js
 import { Router } from "express";
 import { pool } from "../db.js";
-import { addMinutes, isBefore, parseISO } from "date-fns";
+import { addMinutes, isBefore } from "date-fns";
 
 export const availability = Router();
 
-/**
- * Devuelve los HH:mm disponibles para un estilista en una fecha dada,
- * tomando como bloque la duración del servicio (o stepMin si se provee).
- *
- * @param {Object} params
- * @param {number} params.stylistId
- * @param {number} params.serviceId
- * @param {string} params.date       // 'YYYY-MM-DD'
- * @param {number=} params.stepMin   // opcional, override de bloque
- * @returns {Promise<string[]>}      // ['10:00','10:30',...]
- */
 export async function getFreeSlots({ stylistId, serviceId, date, stepMin }) {
-  if (!stylistId || !serviceId || !date) return [];
+  if (!stylistId || !serviceId || !date) return { slots: [], busySlots: [] };
 
-  // 1) duración del servicio
+  // 1) Duración del servicio
   const [[svc]] = await pool.query(
     `SELECT duration_min FROM service WHERE id=? AND is_active=1`,
     [serviceId]
   );
-  if (!svc) return [];
+  if (!svc) return { slots: [], busySlots: [] };
   const blockMin = Number(stepMin || svc.duration_min || 30);
 
-  // 2) working hours del día (weekday 0..6)
+  // 2) Working hours
   const weekday = new Date(`${date}T00:00:00`).getDay();
   const [whRows] = await pool.query(
     `SELECT start_time, end_time
@@ -35,15 +24,13 @@ export async function getFreeSlots({ stylistId, serviceId, date, stepMin }) {
       WHERE stylist_id=? AND weekday=?`,
     [stylistId, weekday]
   );
-  if (!whRows.length) return [];
+  if (!whRows.length) return { slots: [], busySlots: [] };
   const { start_time, end_time } = whRows[0];
 
-  // 3) Armar rango del día en UTC (usamos la hora "local" del server)
-  //    Si prefieres, podrías ajustar a una TZ fija con date-fns-tz.
   const open = new Date(`${date}T${start_time}`);
   const close = new Date(`${date}T${end_time}`);
 
-  // 4) traer turnos del día (scheduled) y ausencias que solapen
+  // 3) Traer turnos y ausencias
   const [appts] = await pool.query(
     `SELECT starts_at, ends_at
        FROM appointment
@@ -57,32 +44,53 @@ export async function getFreeSlots({ stylistId, serviceId, date, stepMin }) {
     [stylistId, open, close]
   );
 
-  // normalizar intervalos ocupados
   const busy = [
-    ...appts.map(a => [new Date(a.starts_at), new Date(a.ends_at)]),
-    ...offs.map(o => [new Date(o.starts_at), new Date(o.ends_at)]),
+    ...appts.map((a) => [new Date(a.starts_at), new Date(a.ends_at)]),
+    ...offs.map((o) => [new Date(o.starts_at), new Date(o.ends_at)]),
   ];
 
-  // 5) generar slots saltando por blockMin
-  const out = [];
-  for (let t = new Date(open); isBefore(addMinutes(t, blockMin), addMinutes(close, 1)); t = addMinutes(t, blockMin)) {
+  console.log(`[AVAILABILITY] ${date} - ${busy.length} ocupados`); // ✅ Debug
+
+  // 4) Generar todos los slots
+  const allSlots = [];
+  const busySlots = [];
+  const now = new Date();
+
+  for (
+    let t = new Date(open);
+    isBefore(addMinutes(t, blockMin), addMinutes(close, 1));
+    t = addMinutes(t, blockMin)
+  ) {
     const start = new Date(t);
     const end = addMinutes(start, blockMin);
 
-    // verificar solape
+    // Filtrar slots pasados
+    if (start <= now) continue;
+
+    const hh = String(start.getHours()).padStart(2, "0");
+    const mm = String(start.getMinutes()).padStart(2, "0");
+    const timeSlot = `${hh}:${mm}`;
+
+    // Verificar solapamiento
     const overlap = busy.some(([b0, b1]) => start < b1 && end > b0);
-    if (!overlap) {
-      const hh = String(start.getHours()).padStart(2, "0");
-      const mm = String(start.getMinutes()).padStart(2, "0");
-      out.push(`${hh}:${mm}`);
+
+    allSlots.push(timeSlot);
+    if (overlap) {
+      busySlots.push(timeSlot);
+      console.log(`  ✗ ${timeSlot} - OCUPADO`); // ✅ Debug
+    } else {
+      console.log(`  ✓ ${timeSlot} - LIBRE`); // ✅ Debug
     }
   }
-  return out;
+
+  console.log(`[RESULT] Total: ${allSlots.length}, Ocupados: ${busySlots.length}`); // ✅ Debug
+
+  return {
+    slots: allSlots,
+    busySlots: busySlots,
+  };
 }
 
-/**
- * GET /api/availability?stylistId=1&serviceId=2&date=2025-10-22&stepMin=10
- */
 availability.get("/availability", async (req, res) => {
   try {
     const stylistId = Number(req.query.stylistId);
@@ -91,13 +99,28 @@ availability.get("/availability", async (req, res) => {
     const stepMin = req.query.stepMin ? Number(req.query.stepMin) : undefined;
 
     if (!stylistId || !serviceId || !date) {
-      return res.status(400).json({ ok:false, error:"Parámetros requeridos: stylistId, serviceId, date" });
+      return res.status(400).json({
+        ok: false,
+        error: "Parámetros requeridos: stylistId, serviceId, date",
+      });
     }
 
-    const slots = await getFreeSlots({ stylistId, serviceId, date, stepMin });
-    return res.json({ ok:true, data:{ slots } });
+    const result = await getFreeSlots({ stylistId, serviceId, date, stepMin });
+
+    console.log("[API RESPONSE]", { // ✅ Debug
+      slots: result.slots.length,
+      busySlots: result.busySlots.length,
+    });
+
+    return res.json({
+      ok: true,
+      data: {
+        slots: result.slots,
+        busySlots: result.busySlots,
+      },
+    });
   } catch (e) {
     console.error("[GET /api/availability] error:", e);
-    return res.status(500).json({ ok:false, error: e.message });
+    return res.status(500).json({ ok: false, error: e.message });
   }
 });

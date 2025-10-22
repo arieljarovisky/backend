@@ -4,19 +4,20 @@ import { sendWhatsAppText } from "../whatsapp.js";
 import { toSandboxAllowed } from "../helpers/numbers.js";
 import { getSession, setStep, reset } from "../helpers/session.js";
 import { sendList, sendButtons } from "../whatsapp-ui.js";
-import { listServices, listStylists } from "../routes/meta.js"; // si exportás helpers, o crea helpers locales
+import { listServices, listStylists } from "../routes/meta.js";
 import { getFreeSlots } from "../routes/availability.js";
-import { createAppointment } from "../routes/appointments.js"; // función que haga el insert/transacción
+import { createAppointment } from "../routes/appointments.js";
 import { parseDay } from "../helpers/parseDay.js";
 import { listUpcomingAppointmentsByPhone } from "../routes/appointments.js";
 import { getCustomerByPhone, upsertCustomerNameByPhone } from "../routes/customers.js";
+import { validateAppointmentDate, isPastDateTime } from "../helpers/dateValidation.js";
 
 export const whatsapp = Router();
 
 // ==== Helpers de paginación (servicios / estilistas / horarios) ====
 function formatMyAppointments(list) {
   if (!list?.length) return "No tenés turnos próximos.";
-  const lines = list.map((a, i) => {
+  const lines = list.map((a) => {
     const d = new Date(a.starts_at);
     const fecha = d.toLocaleDateString("es-AR", { weekday: "short", day: "2-digit", month: "2-digit" });
     const hora = d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
@@ -24,61 +25,93 @@ function formatMyAppointments(list) {
   });
   return `Estos son tus próximos turnos:\n${lines.join("\n")}`;
 }
+
 function buildServiceRows(services, offset = 0) {
-  const page = services.slice(offset, offset + 9).map(s => ({
-    id: `svc_${s.id}`, title: s.name, description: `${s.duration_min} min`
+  const page = services.slice(offset, offset + 9).map((s) => ({
+    id: `svc_${s.id}`,
+    title: s.name,
+    description: `${s.duration_min} min`,
   }));
-  if (offset + 9 < services.length) page.push({ id: "svc_page_next", title: "Ver más…", description: "Más servicios" });
+  if (offset + 9 < services.length) {
+    page.push({ id: "svc_page_next", title: "Ver más…", description: "Más servicios" });
+  }
   return page;
 }
 
 function buildStylistRows(stylists, offset = 0) {
-  const page = stylists.slice(offset, offset + 9).map(st => ({
-    id: `stf_${st.id}`, title: st.name
+  const page = stylists.slice(offset, offset + 9).map((st) => ({
+    id: `stf_${st.id}`,
+    title: st.name,
   }));
-  if (offset + 9 < stylists.length) page.push({ id: "stf_page_next", title: "Ver más…", description: "Más peluqueros" });
+  if (offset + 9 < stylists.length) {
+    page.push({ id: "stf_page_next", title: "Ver más…", description: "Más peluqueros" });
+  }
   return page;
 }
 
 function buildSlotRows(slots, day, offset = 0) {
-  const page = slots.slice(offset, offset + 9).map(h => ({
-    id: `slot_${day}_${h}`, title: h
+  const now = new Date();
+
+  // ✅ Filtrar slots pasados
+  const validSlots = slots.filter((h) => {
+    const slotTime = new Date(`${day}T${h}:00`);
+    return slotTime > now;
+  });
+
+  const page = validSlots.slice(offset, offset + 9).map((h) => ({
+    id: `slot_${day}_${h}`,
+    title: h,
   }));
-  if (offset + 9 < slots.length) page.push({ id: "slot_page_next", title: "Ver más…", description: "Más horarios" });
+
+  if (offset + 9 < validSlots.length) {
+    page.push({ id: "slot_page_next", title: "Ver más…", description: "Más horarios" });
+  }
+
   return page;
 }
 
 function extractNameFromText(txt) {
   let t = (txt || "").trim();
-  // soportá formas comunes
-  t = t.replace(/^soy\s+/i, "")
+  t = t
+    .replace(/^soy\s+/i, "")
     .replace(/^me llamo\s+/i, "")
     .replace(/^mi nombre es\s+/i, "");
-  // capitalizar simple
-  return t.split(" ")
+
+  return t
+    .split(" ")
     .filter(Boolean)
-    .map(w => w[0]?.toUpperCase() + w.slice(1).toLowerCase())
+    .map((w) => w[0]?.toUpperCase() + w.slice(1).toLowerCase())
     .join(" ")
     .slice(0, 80);
 }
-/** GET verify */
+
+// ============================================
+// GET verify
+// ============================================
 whatsapp.get("/webhooks/whatsapp", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
+
   if (mode === "subscribe" && token === process.env.WHATSAPP_VERIFY_TOKEN) {
     return res.status(200).send(challenge);
   }
   return res.sendStatus(403);
 });
 
-/** POST inbound */
+// ============================================
+// POST inbound
+// ============================================
 whatsapp.post("/webhooks/whatsapp", async (req, res) => {
   try {
     const msg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (!msg) return res.sendStatus(200);
 
-    const user = toSandboxAllowed(msg.from);
+    // ✅ Normalizar número (solo en desarrollo/sandbox si es necesario)
+    const user = process.env.NODE_ENV === "development"
+      ? toSandboxAllowed(msg.from)
+      : msg.from;
+
     const session = getSession(user);
 
     // === TEXT ===
@@ -112,8 +145,8 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
           body: "¿Qué querés hacer?",
           buttons: [
             { id: "action_view", title: "Ver mis turnos" },
-            { id: "action_new", title: "Reservar nuevo" }
-          ]
+            { id: "action_new", title: "Reservar nuevo" },
+          ],
         });
         setStep(user, "home_menu", { hasApts: true });
         return res.sendStatus(200);
@@ -134,8 +167,8 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
           body: "¿Qué querés hacer?",
           buttons: [
             { id: "action_view", title: "Ver mis turnos" },
-            { id: "action_new", title: "Reservar nuevo" }
-          ]
+            { id: "action_new", title: "Reservar nuevo" },
+          ],
         });
         setStep(user, "home_menu", { hasApts: true, customer_name: name });
         return res.sendStatus(200);
@@ -144,8 +177,48 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
       // ======= FECHA (después de elegir peluquero) =======
       if (session.step === "picking_day") {
         const day = parseDay(text); // "hoy" | "mañana" | "DD/MM" -> "YYYY-MM-DD"
+
         if (!day) {
           await sendWhatsAppText(user, "No te entendí. Decime *hoy*, *mañana* o *DD/MM*");
+          return res.sendStatus(200);
+        }
+
+        // ✅ Validar que no sea fecha pasada
+        const selectedDate = new Date(day + "T00:00:00");
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+
+        if (selectedDate < today) {
+          await sendWhatsAppText(
+            user,
+            "⚠️ No podés reservar turnos para fechas pasadas.\n\n" +
+            "Decime *hoy*, *mañana* o una fecha futura (ej: 25/12)"
+          );
+          return res.sendStatus(200);
+        }
+
+        // ✅ Validar que esté dentro del rango (ej: máx 90 días)
+        const maxDate = new Date(today);
+        maxDate.setDate(maxDate.getDate() + 90);
+
+        if (selectedDate > maxDate) {
+          await sendWhatsAppText(
+            user,
+            "⚠️ Solo podés reservar turnos hasta dentro de 90 días.\n\n" +
+            "Elegí una fecha más cercana."
+          );
+          return res.sendStatus(200);
+        }
+
+        // ✅ Validar día hábil (opcional - ajustá según tu negocio)
+        const dayOfWeek = selectedDate.getDay();
+        if (dayOfWeek === 0) {
+          // 0 = Domingo
+          await sendWhatsAppText(
+            user,
+            "⚠️ No trabajamos los domingos.\n\n" +
+            "Elegí otro día de la semana."
+          );
           return res.sendStatus(200);
         }
 
@@ -153,23 +226,26 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
         const slots = await _getSlots(session.data.stylist_id, session.data.service_id, day);
 
         if (!slots.length) {
-          await sendWhatsAppText(user, "No hay horarios libres ese día. Probá otra fecha.");
+          await sendWhatsAppText(
+            user,
+            "No hay horarios libres ese día 😕\n\n" +
+            "Probá con otra fecha."
+          );
           return res.sendStatus(200);
         }
 
         // Guardar y mostrar lista (con paginación)
         setStep(user, "picking_time", { day, slots, slotOffset: 0 });
 
-        const rows = buildSlotRows(slots, day, 0); // usa tu helper (9 + "Ver más…")
+        const rows = buildSlotRows(slots, day, 0);
         await sendList(user, {
           header: `Horarios ${day}`,
           body: "Elegí un horario:",
           buttonText: "Ver horarios",
-          rows
+          rows,
         });
         return res.sendStatus(200);
       }
-
 
       // ======= MENSAJE GENÉRICO =======
       await sendWhatsAppText(user, "Escribí *hola* para empezar o *cancelar* para salir.");
@@ -185,16 +261,18 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
       if (session.step === "home_menu" && (id === "action_view" || id === "action_new")) {
         if (id === "action_view") {
           const myApts = await listUpcomingAppointmentsByPhone(user, { limit: 5 });
-          const text = formatMyAppointments(myApts); // "No tenés turnos..." o listado formateado
+          const text = formatMyAppointments(myApts);
           await sendWhatsAppText(user, text);
+
           // Ofrecé reservar después de mostrar los turnos
           await sendButtons(user, {
             header: "¿Algo más?",
             body: "Podés reservar un nuevo turno cuando quieras.",
-            buttons: [{ id: "action_new", title: "Reservar nuevo" }]
+            buttons: [{ id: "action_new", title: "Reservar nuevo" }],
           });
           return res.sendStatus(200);
         }
+
         if (id === "action_new") {
           const services = await _listServices();
           if (!services.length) {
@@ -207,7 +285,7 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
             header: "Elegí un servicio",
             body: "Servicios disponibles:",
             buttonText: "Ver servicios",
-            rows
+            rows,
           });
           return res.sendStatus(200);
         }
@@ -223,14 +301,13 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
             header: "Elegí un servicio",
             body: "Servicios disponibles:",
             buttonText: "Ver servicios",
-            rows
+            rows,
           });
           return res.sendStatus(200);
         }
 
         const service_id = Number(id.slice(4));
-        // Nombre de servicio guardado
-        const svc = (session.data.services || []).find(s => s.id === service_id);
+        const svc = (session.data.services || []).find((s) => s.id === service_id);
         const service_name = svc?.name || `Servicio ${service_id}`;
 
         const stylists = await _listStylists();
@@ -246,7 +323,7 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
           header: "Elegí peluquero",
           body: "Disponibles:",
           buttonText: "Ver peluqueros",
-          rows
+          rows,
         });
         return res.sendStatus(200);
       }
@@ -261,14 +338,13 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
             header: "Elegí peluquero",
             body: "Disponibles:",
             buttonText: "Ver peluqueros",
-            rows
+            rows,
           });
           return res.sendStatus(200);
         }
 
         const stylist_id = Number(id.slice(4));
-        // Nombre del peluquero guardado
-        const st = (session.data.stylists || []).find(x => x.id === stylist_id);
+        const st = (session.data.stylists || []).find((x) => x.id === stylist_id);
         const stylist_name = st?.name || `Peluquero ${stylist_id}`;
 
         setStep(user, "picking_day", { stylist_id, stylist_name });
@@ -286,15 +362,26 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
             header: `Horarios ${session.data.day}`,
             body: "Elegí un horario:",
             buttonText: "Ver horarios",
-            rows
+            rows,
           });
           return res.sendStatus(200);
         }
 
         const [, day, hhmm] = id.split("_"); // slot_YYYY-MM-DD_HH:mm
+
+        // ✅ Validar que el horario no haya pasado mientras el usuario elegía
+        const slotDateTime = `${day} ${hhmm}:00`;
+        if (isPastDateTime(slotDateTime)) {
+          await sendWhatsAppText(
+            user,
+            "⚠️ Ups, ese horario ya pasó mientras elegías.\n\n" +
+            "Elegí otro horario o escribí *hola* para empezar de nuevo."
+          );
+          return res.sendStatus(200);
+        }
+
         setStep(user, "confirming", { hhmm });
 
-        // Mostrar nombres en la confirmación
         const svcName = session.data.service_name || `Servicio ${session.data.service_id}`;
         const stName = session.data.stylist_name || `Peluquero ${session.data.stylist_id}`;
 
@@ -303,8 +390,8 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
           body: `Servicio: *${svcName}*\nPeluquero: *${stName}*\nDía/Hora: *${day} ${hhmm}*`,
           buttons: [
             { id: "confirm_yes", title: "Confirmar" },
-            { id: "confirm_change", title: "Cambiar" }
-          ]
+            { id: "confirm_change", title: "Cambiar" },
+          ],
         });
         return res.sendStatus(200);
       }
@@ -316,24 +403,66 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
           await sendWhatsAppText(user, "Ok, decime otra fecha.");
           return res.sendStatus(200);
         }
+
         if (id === "confirm_yes") {
           try {
-            const iso = `${session.data.day}T${session.data.hhmm}:00-03:00`; // ajustar TZ si querés
-            await _book(user, session.data.stylist_id, session.data.service_id, iso);
+            const fullDateTime = `${session.data.day} ${session.data.hhmm}:00`;
+
+            // ✅ Validación completa antes de crear el turno
+            try {
+              validateAppointmentDate(fullDateTime);
+            } catch (validationError) {
+              await sendWhatsAppText(
+                user,
+                `⚠️ ${validationError.message}\n\n` +
+                "Escribí *hola* para empezar de nuevo."
+              );
+              reset(user);
+              return res.sendStatus(200);
+            }
+
+            // ✅ Doble check que no sea pasado (por si acaso)
+            if (isPastDateTime(fullDateTime)) {
+              await sendWhatsAppText(
+                user,
+                "⚠️ Ese horario ya pasó mientras elegías.\n\n" +
+                "Escribí *hola* para empezar de nuevo."
+              );
+              reset(user);
+              return res.sendStatus(200);
+            }
+
+            await _book(user, session.data.stylist_id, session.data.service_id, fullDateTime);
             reset(user);
             await sendWhatsAppText(user, "¡Listo! Turno reservado ✅");
           } catch (e) {
             const m = String(e?.message || "");
-            if (m.includes("MAX_ACTIVE_APPOINTMENTS_REACHED")) {
+            if (m.includes("pasado")) {
               await sendWhatsAppText(
                 user,
-                "Tenés *2 turnos activos* ya reservados. Para sacar otro, primero *cancelá* uno de los existentes."
+                "⚠️ No podés agendar turnos en el pasado.\n\n" +
+                "Escribí *hola* para empezar de nuevo."
+              );
+            } else if (m.includes("MAX_ACTIVE_APPOINTMENTS")) {
+              await sendWhatsAppText(
+                user,
+                "Tenés *2 turnos activos* ya reservados.\n\n" +
+                "Para sacar otro, primero *cancelá* uno de los existentes."
               );
             } else if (m.includes("SLOT")) {
-              await sendWhatsAppText(user, "Uff, ese horario se acaba de ocupar. Probemos otro.");
+              await sendWhatsAppText(
+                user,
+                "Uff, ese horario se acaba de ocupar 😕\n\n" +
+                "Escribí *hola* para elegir otro."
+              );
             } else {
-              await sendWhatsAppText(user, "No pude guardar el turno. Probá de nuevo.");
+              await sendWhatsAppText(
+                user,
+                "No pude guardar el turno.\n\n" +
+                "Probá de nuevo escribiendo *hola*."
+              );
             }
+            reset(user);
           }
           return res.sendStatus(200);
         }
@@ -342,8 +471,7 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
       return res.sendStatus(200);
     }
 
-
-    // otros tipos
+    // Otros tipos de mensaje
     await sendWhatsAppText(user, "Mandame texto o usá las opciones 😉");
     return res.sendStatus(200);
   } catch (e) {
@@ -352,41 +480,29 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
   }
 });
 
-
-/* === adaptadores a tus rutas/servicios ya existentes ===
-   Si tus funciones están exportadas distinto, ajustá acá
-*/
+// ============================================
+// Adaptadores a servicios existentes
+// ============================================
 async function _listServices() {
-  // devuelve [{id,name,duration_min}]
-  const { data } = await listServices._handler?.() ?? {};
-  return data || await listServices(); // según cómo lo tengas exportado
+  const data = await listServices();
+  return Array.isArray(data) ? data : data?.data || [];
 }
+
 async function _listStylists() {
-  const { data } = await listStylists._handler?.() ?? {};
-  return data || await listStylists();
+  const data = await listStylists();
+  return Array.isArray(data) ? data : data?.data || [];
 }
+
 async function _getSlots(stylistId, serviceId, date) {
-  // espera {query: {stylistId, serviceId, date}}
-  if (getFreeSlots._handler) {
-    const resp = await getFreeSlots._handler({ query: { stylistId, serviceId, date } });
-    return resp?.data?.slots?.map(s => s.slice(11, 16)) || []; // "YYYY-MM-DDTHH:mm..."
-  }
-  // o si exportaste helper puro:
-  return await getFreeSlots({ stylistId, serviceId, date });
+  const slots = await getFreeSlots({ stylistId, serviceId, date });
+  return Array.isArray(slots) ? slots : slots?.data?.slots || [];
 }
-async function _book(customerPhoneE164, stylistId, serviceId, startsAtISO) {
-  if (createAppointment._handler) {
-    return createAppointment._handler({
-      body: {
-        customerPhone: customerPhoneE164,
-        stylistId, serviceId,
-        startsAt: startsAtISO
-      }
-    });
-  }
+
+async function _book(customerPhoneE164, stylistId, serviceId, startsAtLocal) {
   return createAppointment({
     customerPhone: customerPhoneE164,
-    stylistId, serviceId,
-    startsAt: startsAtISO
+    stylistId,
+    serviceId,
+    startsAt: startsAtLocal, // "YYYY-MM-DD HH:MM:SS"
   });
 }

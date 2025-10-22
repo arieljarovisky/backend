@@ -1,70 +1,97 @@
 // src/whatsapp.js
-const BASE_URL = `https://graph.facebook.com/${process.env.WHATSAPP_API_VERSION}/${process.env.WHATSAPP_PHONE_NUMBER_ID}`;
-const TOKEN = (process.env.WHATSAPP_TOKEN || "").trim();
+const WA_API_VERSION = process.env.WHATSAPP_API_VERSION || "v20.0";
+const WA_PHONE_NUMBER_ID = (process.env.WHATSAPP_PHONE_NUMBER_ID || "").trim();
+const WA_TOKEN = (process.env.WHATSAPP_TOKEN || "").trim();
+const DEFAULT_COUNTRY = (process.env.DEFAULT_COUNTRY_DIAL || "54").replace(/^\+/, ""); // 54 = AR
+const DEBUG = String(process.env.WHATSAPP_DEBUG || "false").toLowerCase() === "true";
 
-/** Normaliza el número a formato numérico (sin + ni espacios) */
-function normalizeTo(num) {
-  return String(num).replace(/\D/g, "");
+if (!WA_PHONE_NUMBER_ID || !WA_TOKEN) {
+  console.error("[WA] Faltan variables de entorno: WHATSAPP_PHONE_NUMBER_ID y/o WHATSAPP_TOKEN");
+  // No tiro error duro para no tumbar el server si solo querés desactivar WA
 }
 
-/** ✅ Enviar texto simple */
-export async function sendWhatsAppText(to, text) {
-  const res = await fetch(`${BASE_URL}/messages`, {
+const BASE_URL = `https://graph.facebook.com/${WA_API_VERSION}/${WA_PHONE_NUMBER_ID}`;
+
+/** Normaliza a E.164 numérica. Si no trae prefijo país, agrega DEFAULT_COUNTRY. */
+function normalizeTo(num) {
+  const digits = String(num || "").replace(/\D/g, "");
+  if (!digits) return "";
+  // ya viene con país (>= 9..10 dígitos), pero chequeamos prefijo
+  return digits.startsWith(DEFAULT_COUNTRY) || digits.startsWith("+" + DEFAULT_COUNTRY)
+    ? digits.replace(/^\+/, "")
+    : DEFAULT_COUNTRY + digits;
+}
+
+/** Fetch con manejo de errores de Graph */
+async function request(path, body) {
+  if (!WA_PHONE_NUMBER_ID || !WA_TOKEN) {
+    if (DEBUG) console.warn("[WA] Saltando envío (sin credenciales):", path, body?.type);
+    return { skipped: true };
+  }
+
+  const res = await fetch(`${BASE_URL}${path}`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${TOKEN}`,
+      Authorization: `Bearer ${WA_TOKEN}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      messaging_product: "whatsapp",
-      to: normalizeTo(to),
-      type: "text",
-      text: { body: text },
-    }),
+    body: JSON.stringify(body),
   });
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`[WA] sendText ${res.status}: ${err}`);
+  let text = "";
+  try { text = await res.text(); } catch {}
+
+  if (DEBUG) {
+    console.log(`[WA][${res.status}] ${path}`, {
+      req: body,
+      resRaw: text?.slice(0, 800),
+    });
   }
+
+  if (!res.ok) {
+    // intento parsear el json de error de Graph
+    try {
+      const j = JSON.parse(text);
+      const err = j?.error || {};
+      const msg = `[WA] ${body?.type || "request"} ${res.status} code=${err.code} sub=${err.error_subcode} type=${err.type} ${err.message || ""} fbtrace_id=${err.fbtrace_id || ""}`;
+      throw new Error(msg);
+    } catch {
+      throw new Error(`[WA] ${body?.type || "request"} ${res.status}: ${text || "(sin cuerpo)"}`);
+    }
+  }
+
+  try { return JSON.parse(text || "{}"); } catch { return {}; }
 }
 
-/** ✅ Enviar plantilla aprobada (HSM) */
+/** ✅ Texto simple */
+export async function sendWhatsAppText(to, text) {
+  const payload = {
+    messaging_product: "whatsapp",
+    to: normalizeTo(to),
+    type: "text",
+    text: { body: String(text) },
+  };
+  return request("/messages", payload);
+}
+
+/** ✅ Plantilla (HSM) aprobada en Business Manager */
 export async function sendWhatsAppTemplate(to, templateName, variables = [], lang = "es") {
   const payload = {
     messaging_product: "whatsapp",
     to: normalizeTo(to),
     type: "template",
     template: {
-      name: templateName,               // ej: "recordatorio_turno"
-      language: { code: lang },         // "es", "es_AR", etc.
-      components: [
-        {
-          type: "body",
-          parameters: variables.map(v => ({ type: "text", text: String(v) })),
-        },
-      ],
+      name: templateName, // ej: recordatorio_turno
+      language: { code: lang }, // "es" | "es_AR" | ...
+      components: variables.length
+        ? [{ type: "body", parameters: variables.map(v => ({ type: "text", text: String(v) })) }]
+        : undefined,
     },
   };
-
-  const res = await fetch(`${BASE_URL}/messages`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  if (!res.ok) {
-    // Intentá parsear JSON para ver code y fbtrace_id
-    let errTxt;
-    try { errTxt = await res.text(); } catch { errTxt = `${res.status}`; }
-    throw new Error(`[WA] sendTemplate ${res.status}: ${errTxt}`);
-  }
+  return request("/messages", payload);
 }
 
-/** (sigue igual) enviar lista interactiva */
+/** ✅ Lista interactiva */
 export async function sendWhatsAppList(to, { header, body, buttonText, sections }) {
   const payload = {
     messaging_product: "whatsapp",
@@ -72,24 +99,41 @@ export async function sendWhatsAppList(to, { header, body, buttonText, sections 
     type: "interactive",
     interactive: {
       type: "list",
-      header: { type: "text", text: header },
-      body: { text: body },
+      header: header ? { type: "text", text: String(header) } : undefined,
+      body: { text: String(body || "") },
       footer: { text: "Pelu de Barrio" },
-      action: { button: buttonText, sections },
+      action: { button: String(buttonText || "Elegir"), sections: sections || [] },
     },
   };
+  return request("/messages", payload);
+}
 
-  const res = await fetch(`${BASE_URL}/messages`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
+/** (Extra) Imagen por URL (útil para flyers/promo) */
+export async function sendWhatsAppImageUrl(to, imageUrl, caption = "") {
+  const payload = {
+    messaging_product: "whatsapp",
+    to: normalizeTo(to),
+    type: "image",
+    image: { link: String(imageUrl), caption: String(caption || "") },
+  };
+  return request("/messages", payload);
+}
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`[WA] sendList ${res.status}: ${err}`);
-  }
+/* ========= Helpers de alto nivel (opcional) ========= */
+
+/** Mensaje de confirmación de turno (texto plano) */
+export async function sendBookingConfirmation({ to, customerName, serviceName, stylistName, startsAt }) {
+  // formateo local legible
+  const d = new Date(startsAt);
+  const fecha = d.toLocaleDateString("es-AR", { weekday: "short", day: "2-digit", month: "2-digit" });
+  const hora = d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
+
+  const msg =
+    `¡Hola ${customerName || ""}! 👋\n` +
+    `✅ Confirmamos tu turno:\n` +
+    `• Servicio: *${serviceName}*\n` +
+    `• Peluquero/a: *${stylistName}*\n` +
+    `• Fecha: *${fecha} ${hora}*\n\n` +
+    `Si necesitás reprogramar, escribinos por acá.`;
+  return sendWhatsAppText(to, msg);
 }

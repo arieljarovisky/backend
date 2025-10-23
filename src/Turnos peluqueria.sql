@@ -1,1 +1,0 @@
-SELECT * FROM pelu_turnos.stylist;

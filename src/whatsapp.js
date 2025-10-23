@@ -1,9 +1,12 @@
 // src/whatsapp.js
+import { toSandboxAllowed } from "./helpers/numbers.js"; 
+
 const WA_API_VERSION = process.env.WHATSAPP_API_VERSION || "v20.0";
 const WA_PHONE_NUMBER_ID = (process.env.WHATSAPP_PHONE_NUMBER_ID || "").trim();
 const WA_TOKEN = (process.env.WHATSAPP_TOKEN || "").trim();
 const DEFAULT_COUNTRY = (process.env.DEFAULT_COUNTRY_DIAL || "54").replace(/^\+/, ""); // 54 = AR
 const DEBUG = String(process.env.WHATSAPP_DEBUG || "false").toLowerCase() === "true";
+
 
 if (!WA_PHONE_NUMBER_ID || !WA_TOKEN) {
   console.error("[WA] Faltan variables de entorno: WHATSAPP_PHONE_NUMBER_ID y/o WHATSAPP_TOKEN");
@@ -13,15 +16,18 @@ if (!WA_PHONE_NUMBER_ID || !WA_TOKEN) {
 const BASE_URL = `https://graph.facebook.com/${WA_API_VERSION}/${WA_PHONE_NUMBER_ID}`;
 
 /** Normaliza a E.164 numérica. Si no trae prefijo país, agrega DEFAULT_COUNTRY. */
-function normalizeTo(num) {
+ export function normalizeTo(num) {
+  // 1) dejá solo dígitos
   const digits = String(num || "").replace(/\D/g, "");
   if (!digits) return "";
-  // ya viene con país (>= 9..10 dígitos), pero chequeamos prefijo
-  return digits.startsWith(DEFAULT_COUNTRY) || digits.startsWith("+" + DEFAULT_COUNTRY)
-    ? digits.replace(/^\+/, "")
-    : DEFAULT_COUNTRY + digits;
-}
 
+  // 2) quita el '9' post 54 para móviles AR (54911xxxx -> 5411xxxx)
+  const arFixed = toSandboxAllowed(digits);
+
+  // 3) si no trae país, agregá el por defecto
+  if (arFixed.startsWith(DEFAULT_COUNTRY)) return arFixed;
+  return DEFAULT_COUNTRY + arFixed;
+}
 /** Fetch con manejo de errores de Graph */
 async function request(path, body) {
   if (!WA_PHONE_NUMBER_ID || !WA_TOKEN) {
@@ -39,7 +45,7 @@ async function request(path, body) {
   });
 
   let text = "";
-  try { text = await res.text(); } catch {}
+  try { text = await res.text(); } catch { }
 
   if (DEBUG) {
     console.log(`[WA][${res.status}] ${path}`, {

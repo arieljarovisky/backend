@@ -11,8 +11,13 @@ import { parseDay } from "../helpers/parseDay.js";
 import { listUpcomingAppointmentsByPhone } from "../routes/appointments.js";
 import { getCustomerByPhone, upsertCustomerNameByPhone } from "../routes/customers.js";
 import { validateAppointmentDate, isPastDateTime } from "../helpers/dateValidation.js";
+import { addHours } from "date-fns";
+
 
 export const whatsapp = Router();
+
+const TZ_OFFSET = -3; // Argentina UTC-3
+const LEAD_MIN = Number(process.env.BOT_LEAD_MIN || 30); // minutos de anticipación mínima
 
 // ==== Helpers de paginación (servicios / estilistas / horarios) ====
 function formatMyAppointments(list) {
@@ -52,10 +57,12 @@ function buildStylistRows(stylists, offset = 0) {
 function buildSlotRows(slots, day, offset = 0) {
   const now = new Date();
 
-  // ✅ Filtrar slots pasados
   const validSlots = slots.filter((h) => {
-    const slotTime = new Date(`${day}T${h}:00`);
-    return slotTime > now;
+    // Convierte el horario local a UTC para comparar correctamente
+    const slotLocal = new Date(`${day}T${h}:00`);
+    const slotUtc = addHours(slotLocal, -TZ_OFFSET); // ajusta por zona horaria
+    const diffMin = (slotUtc.getTime() - now.getTime()) / 60000;
+    return diffMin >= LEAD_MIN; // descarta turnos pasados o con poca anticipación
   });
 
   const page = validSlots.slice(offset, offset + 9).map((h) => ({
@@ -69,7 +76,6 @@ function buildSlotRows(slots, day, offset = 0) {
 
   return page;
 }
-
 function extractNameFromText(txt) {
   let t = (txt || "").trim();
   t = t
@@ -494,8 +500,21 @@ async function _listStylists() {
 }
 
 async function _getSlots(stylistId, serviceId, date) {
-  const slots = await getFreeSlots({ stylistId, serviceId, date });
-  return Array.isArray(slots) ? slots : slots?.data?.slots || [];
+  // fuerza números por las dudas
+  const res = await getFreeSlots({
+    stylistId: Number(stylistId),
+    serviceId: Number(serviceId),
+    date
+  });
+
+  // normalizamos todas las formas posibles de respuesta
+  if (Array.isArray(res)) return res;
+  if (Array.isArray(res?.slots)) return res.slots;
+  if (Array.isArray(res?.data?.slots)) return res.data.slots;
+
+  // debug opcional
+  console.log("[BOT] getFreeSlots() respuesta inesperada:", res);
+  return [];
 }
 
 async function _book(customerPhoneE164, stylistId, serviceId, startsAtLocal) {

@@ -1,10 +1,10 @@
 // src/whatsapp-ui.js
-// src/whatsapp-ui.js
+import { normalizeTo } from "./whatsapp.js";
 export async function sendList(to, { header, body, buttonText, rows, title = "Opciones" }) {
   const limited = rows.slice(0, 10); // ← nunca más de 10 filas
   const payload = {
     messaging_product: "whatsapp",
-    to: String(to).replace(/\D/g, ""),
+    to: normalizeTo(to),
     type: "interactive",
     interactive: {
       type: "list",
@@ -20,7 +20,7 @@ export async function sendList(to, { header, body, buttonText, rows, title = "Op
 export async function sendButtons(to, { header, body, buttons }) {
   const payload = {
     messaging_product: "whatsapp",
-    to: String(to).replace(/\D/g, ""),
+     to: normalizeTo(to),
     type: "interactive",
     interactive: {
       type: "button",

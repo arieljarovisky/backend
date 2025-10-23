@@ -53,10 +53,7 @@ nohup.out
 src/helpers/session.json
 src/helpers/numbers.json
 
-# Archivos de base de datos locales
-*.sql
-*.sqlite
-*.db
+
 
 # Sistema de ngrok o túneles locales
 .ngrok2/

@@ -561,13 +561,13 @@ async function _book(customerPhoneE164, stylistId, serviceId, startsAtLocal) {
 }
 
 async function _bookWithDeposit(customerPhoneE164, stylistId, serviceId, startsAtLocal, depositDecimal) {
-
   return createAppointment({
     customerPhone: customerPhoneE164,
     stylistId,
     serviceId,
-    startsAt: startsAtLocal,           // "YYYY-MM-DD HH:MM:SS"
+    startsAt: startsAtLocal,
     depositDecimal: Number(depositDecimal || 0),
+    status: "pending_deposit",         // 👈 clave
     markDepositAsPaid: false
   });
 }

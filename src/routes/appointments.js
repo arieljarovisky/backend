@@ -121,9 +121,9 @@ export async function createAppointment({
   serviceId,
   startsAt,
   endsAt = null,
-  status = "scheduled",
+  status = "scheduled",          // 👈 ahora respetamos el status que venga
   durationMin = null,
-  depositDecimal = 0,
+  depositDecimal = 0,            // 👈 seña
   markDepositAsPaid = false
 }) {
   if (!customerPhone || !stylistId || !serviceId || !startsAt) {
@@ -133,6 +133,8 @@ export async function createAppointment({
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+
+    console.log("[createAppointment] IN", { stylistId, serviceId, startsAt, status, depositDecimal });
 
     // upsert cliente
     await conn.query(
@@ -149,9 +151,10 @@ export async function createAppointment({
     const startMySQL = anyToMySQL(startsAt);
     if (!startMySQL) throw new Error("Fecha/hora inválida");
 
+    // calcular fin si hace falta
     let endMySQL = anyToMySQL(endsAt);
     if (!endMySQL) {
-      const dur = await resolveServiceDuration(serviceId, durationMin, conn); // 👈 usa conn
+      const dur = await resolveServiceDuration(serviceId, durationMin, conn);
       if (!dur) throw new Error("No se pudo determinar la duración del servicio");
       const [[{ calc_end }]] = await conn.query(
         "SELECT DATE_ADD(STR_TO_DATE(?, '%Y-%m-%d %H:%i:%s'), INTERVAL ? MINUTE) AS calc_end",
@@ -160,8 +163,9 @@ export async function createAppointment({
       endMySQL = anyToMySQL(calc_end);
     }
 
+    // horario laboral
     const dateStr = startMySQL.slice(0, 10);
-    const wh = await getWorkingHoursForDate(stylistId, dateStr, conn); // 👈 usa conn
+    const wh = await getWorkingHoursForDate(stylistId, dateStr, conn);
     if (!wh) throw new Error("El peluquero no tiene horarios definidos para ese día");
 
     const startDate = new Date(startMySQL.replace(" ", "T"));
@@ -170,26 +174,32 @@ export async function createAppointment({
       throw new Error("Fuera del horario laboral");
     }
 
-    // 👇 Timeout defensivo: si overlap se cuelga, fallá con mensaje claro
-    console.log("[createAppointment] checking overlap...");
-    await withTimeout(
-      // IMPORTANTE: pasá el MISMO tipo que usás en el PUT. Si en el PUT le pasás `pool`, hacelo igual acá:
-      checkAppointmentOverlap(pool, {    // ← usa pool en ambos lugares, no mezcles conn/pool
-        stylistId: Number(stylistId),
-        startTime: startDate,
-        endTime: endDate,
-        bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0)
-      }),
-      5000,
-      "Timeout en validación de solapamiento"
-    );
-    console.log("[createAppointment] overlap OK");
+    // overlap (mantené el mismo contrato que usás en PUT: con pool)
+    await checkAppointmentOverlap(pool, {
+      stylistId: Number(stylistId),
+      startTime: startDate,
+      endTime: endDate,
+      bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0)
+    });
 
-    // INSERT con seña (si ya lo agregaste)
+    // hold si está pendiente de seña
+    let holdUntil = null;
+    if (String(status) === "pending_deposit") {
+      const holdMin = Number(process.env.DEPOSIT_HOLD_MIN || 30); // default 30'
+      const [[{ hu }]] = await conn.query(
+        "SELECT DATE_ADD(NOW(), INTERVAL ? MINUTE) AS hu",
+        [holdMin]
+      );
+      holdUntil = anyToMySQL(hu);
+    }
+
+    // insert
+    const paidAt = markDepositAsPaid ? new Date() : null;
     const [r] = await conn.query(
-      `INSERT INTO appointment (customer_id, stylist_id, service_id, deposit_decimal, starts_at, ends_at, status, created_at)
-       VALUES (?,?,?,?,?,?,?, NOW())`,
-      [cust.id, Number(stylistId), Number(serviceId), Number(depositDecimal || 0), startMySQL, endMySQL, status]
+      `INSERT INTO appointment
+         (customer_id, stylist_id, service_id, deposit_decimal, starts_at, ends_at, status, hold_until, ${paidAt ? "deposit_paid_at," : ""} created_at)
+       VALUES (?,?,?,?,?,?, ?, ?, ${paidAt ? "?," : ""} NOW())`,
+      [cust.id, Number(stylistId), Number(serviceId), Number(depositDecimal || 0), startMySQL, endMySQL, status, holdUntil, ...(paidAt ? [anyToMySQL(paidAt)] : [])]
     );
 
     await conn.commit();
@@ -597,6 +607,6 @@ function withTimeout(promise, ms, label = "timeout") {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(label)), ms);
     promise.then((v) => { clearTimeout(t); resolve(v); })
-           .catch((e) => { clearTimeout(t); reject(e); });
+      .catch((e) => { clearTimeout(t); reject(e); });
   });
 }

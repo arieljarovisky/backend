@@ -83,3 +83,6 @@ sandbox-test-data/
 Thumbs.db
 ehthumbs.db
 desktop.ini
+
+
+.env

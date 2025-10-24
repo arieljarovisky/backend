@@ -56,9 +56,9 @@ function fmtLocal(iso) {
 }
 
 /* ========= Working hours ========= */
-async function getWorkingHoursForDate(stylistId, dateStr) {
+async function getWorkingHoursForDate(stylistId, dateStr, db = pool) {
   const weekday = new Date(`${dateStr}T00:00:00`).getDay(); // 0..6
-  const [rows] = await pool.query(
+  const [rows] = await db.query(
     `SELECT start_time, end_time
        FROM working_hours
       WHERE stylist_id=? AND weekday=? LIMIT 1`,
@@ -74,10 +74,10 @@ function insideWorkingHours(dateStr, start_time, end_time, start, end) {
 }
 
 /* ========= Servicios / duración ========= */
-async function resolveServiceDuration(serviceId, fallbackDurationMin) {
+async function resolveServiceDuration(serviceId, fallbackDurationMin, db = pool) {
   try {
     if (serviceId) {
-      const [[row]] = await pool.query(
+      const [[row]] = await db.query(
         "SELECT duration_min FROM service WHERE id = ? LIMIT 1",
         [serviceId]
       );
@@ -123,6 +123,8 @@ export async function createAppointment({
   endsAt = null,
   status = "scheduled",
   durationMin = null,
+  depositDecimal = 0,
+  markDepositAsPaid = false
 }) {
   if (!customerPhone || !stylistId || !serviceId || !startsAt) {
     throw new Error("Faltan campos requeridos");
@@ -149,7 +151,7 @@ export async function createAppointment({
 
     let endMySQL = anyToMySQL(endsAt);
     if (!endMySQL) {
-      const dur = await resolveServiceDuration(serviceId, durationMin);
+      const dur = await resolveServiceDuration(serviceId, durationMin, conn); // 👈 usa conn
       if (!dur) throw new Error("No se pudo determinar la duración del servicio");
       const [[{ calc_end }]] = await conn.query(
         "SELECT DATE_ADD(STR_TO_DATE(?, '%Y-%m-%d %H:%i:%s'), INTERVAL ? MINUTE) AS calc_end",
@@ -159,7 +161,7 @@ export async function createAppointment({
     }
 
     const dateStr = startMySQL.slice(0, 10);
-    const wh = await getWorkingHoursForDate(stylistId, dateStr);
+    const wh = await getWorkingHoursForDate(stylistId, dateStr, conn); // 👈 usa conn
     if (!wh) throw new Error("El peluquero no tiene horarios definidos para ese día");
 
     const startDate = new Date(startMySQL.replace(" ", "T"));
@@ -168,30 +170,39 @@ export async function createAppointment({
       throw new Error("Fuera del horario laboral");
     }
 
-    // ✅ VALIDACIÓN ROBUSTA DE OVERLAP
-    await checkAppointmentOverlap(conn, {
-      stylistId: Number(stylistId),
-      startTime: startDate,
-      endTime: endDate,
-      bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0)
-    });
+    // 👇 Timeout defensivo: si overlap se cuelga, fallá con mensaje claro
+    console.log("[createAppointment] checking overlap...");
+    await withTimeout(
+      // IMPORTANTE: pasá el MISMO tipo que usás en el PUT. Si en el PUT le pasás `pool`, hacelo igual acá:
+      checkAppointmentOverlap(pool, {    // ← usa pool en ambos lugares, no mezcles conn/pool
+        stylistId: Number(stylistId),
+        startTime: startDate,
+        endTime: endDate,
+        bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0)
+      }),
+      5000,
+      "Timeout en validación de solapamiento"
+    );
+    console.log("[createAppointment] overlap OK");
 
+    // INSERT con seña (si ya lo agregaste)
     const [r] = await conn.query(
-      `INSERT INTO appointment (customer_id, stylist_id, service_id, starts_at, ends_at, status, created_at)
-       VALUES (?,?,?,?,?, ?, NOW())`,
-      [cust.id, Number(stylistId), Number(serviceId), startMySQL, endMySQL, status]
+      `INSERT INTO appointment (customer_id, stylist_id, service_id, deposit_decimal, starts_at, ends_at, status, created_at)
+       VALUES (?,?,?,?,?,?,?, NOW())`,
+      [cust.id, Number(stylistId), Number(serviceId), Number(depositDecimal || 0), startMySQL, endMySQL, status]
     );
 
     await conn.commit();
+    console.log("[createAppointment] OUT", r.insertId);
     return { ok: true, id: r.insertId };
   } catch (e) {
+    console.error("[createAppointment] ERROR:", e?.message);
     await conn.rollback();
     throw e;
   } finally {
     conn.release();
   }
 }
-
 /* ========= Router ========= */
 export const appointments = Router();
 
@@ -200,12 +211,14 @@ appointments.get("/", async (req, res) => {
   try {
     const { from, to, stylistId } = req.query;
     let sql = `
-      SELECT a.id, a.customer_id, a.stylist_id, a.service_id, a.status,
-             DATE_FORMAT(a.starts_at, '%Y-%m-%dT%H:%i:%s') AS starts_at,
-             DATE_FORMAT(a.ends_at,   '%Y-%m-%dT%H:%i:%s') AS ends_at,
-             c.name  AS customer_name, c.phone_e164,
-             s.name  AS service_name,
-             st.name AS stylist_name, st.color_hex
+       SELECT a.id, a.customer_id, a.stylist_id, a.service_id, a.status,
+       a.deposit_decimal,
+       DATE_FORMAT(a.deposit_paid_at, '%Y-%m-%dT%H:%i:%s') AS deposit_paid_at,
+       DATE_FORMAT(a.starts_at, '%Y-%m-%dT%H:%i:%s') AS starts_at,
+       DATE_FORMAT(a.ends_at,   '%Y-%m-%dT%H:%i:%s') AS ends_at,
+       c.name AS customer_name, c.phone_e164,
+       s.name AS service_name,
+       st.name AS stylist_name, st.color_hex
         FROM appointment a
         JOIN customer  c  ON c.id  = a.customer_id
         JOIN service   s  ON s.id  = a.service_id
@@ -351,7 +364,7 @@ appointments.post("/", async (req, res) => {
 
     await conn.commit();
     console.log("   ✅ Turno creado con ID:", createdId);
-    
+
     res.status(201).json({ ok: true, id: createdId });
 
     // WhatsApp en segundo plano (sin await)
@@ -391,7 +404,22 @@ appointments.put("/:id", async (req, res) => {
     const { id } = req.params;
     const b = req.body || {};
 
+    // 👇 NUEVO: seña y marca de pago
+    const depositDecimal = b.depositDecimal ?? null;
+    const markDepositAsPaid = b.markDepositAsPaid === true;
+
     console.log(`\n✏️  [PUT /appointments/${id}] Actualización:`);
+
+    // Traigo el turno actual para conocer service_id / stylist_id si no los mandan
+    const [[current]] = await pool.query(
+      `SELECT id, customer_id, stylist_id, service_id, starts_at, ends_at, status, deposit_decimal
+         FROM appointment WHERE id=? LIMIT 1`,
+      [id]
+    );
+    if (!current) {
+      console.error("   ❌ Turno no encontrado");
+      return res.status(404).json({ ok: false, error: "Turno no encontrado" });
+    }
 
     let newCustomerId = null;
     if (b.customerPhone || b.phone_e164) {
@@ -401,29 +429,27 @@ appointments.put("/:id", async (req, res) => {
       });
     }
 
-    const stylistId = b.stylistId ?? b.stylist_id ?? null;
-    const serviceId = b.serviceId ?? b.service_id ?? null;
+    // Si no me mandan, uso los actuales
+    const stylistId = (b.stylistId ?? b.stylist_id) ?? current.stylist_id;
+    const serviceId = (b.serviceId ?? b.service_id) ?? current.service_id;
     const status = b.status ?? null;
     const durationMin = b.durationMin ?? null;
 
     let startMySQL = anyToMySQL(b.startsAt ?? b.starts_at);
     let endMySQL = anyToMySQL(b.endsAt ?? b.ends_at);
 
-    // ✅ VALIDAR si se modifica la fecha
+    // ✅ Validación de fecha si cambia inicio
     if (startMySQL) {
       try {
         validateAppointmentDate(startMySQL);
         console.log("   ✅ Validación de fecha OK");
       } catch (validationError) {
         console.error("   ❌ Fecha inválida:", validationError.message);
-        return res.status(400).json({
-          ok: false,
-          error: validationError.message
-        });
+        return res.status(400).json({ ok: false, error: validationError.message });
       }
     }
 
-    // Calcular fin si no vino y tenemos inicio + duración
+    // Si no viene fin, lo calculo con duración (del servicio efectivo)
     if (!endMySQL && (startMySQL || serviceId || durationMin != null)) {
       const dur = await resolveServiceDuration(serviceId, durationMin);
       if (!dur || !startMySQL) {
@@ -436,11 +462,13 @@ appointments.put("/:id", async (req, res) => {
       endMySQL = anyToMySQL(calc_end);
     }
 
-    // Validar horarios si cambia rango/estilista
-    if (startMySQL && endMySQL && stylistId) {
+    // Validar horarios y overlaps si cambia rango (inicio/fin)
+    if (startMySQL && endMySQL) {
       const dateStr = startMySQL.slice(0, 10);
       const wh = await getWorkingHoursForDate(stylistId, dateStr);
-      if (!wh) return res.status(400).json({ ok: false, error: "El peluquero no tiene horarios definidos para ese día" });
+      if (!wh) {
+        return res.status(400).json({ ok: false, error: "El peluquero no tiene horarios definidos para ese día" });
+      }
 
       const startDate = new Date(startMySQL.replace(" ", "T"));
       const endDate = new Date(endMySQL.replace(" ", "T"));
@@ -449,35 +477,66 @@ appointments.put("/:id", async (req, res) => {
         return res.status(400).json({ ok: false, error: "Fuera del horario laboral" });
       }
 
-      // ✅ VALIDACIÓN DE OVERLAP (excluyendo este turno)
       try {
         await checkAppointmentOverlap(pool, {
           stylistId: Number(stylistId),
           startTime: startDate,
           endTime: endDate,
-          excludeId: id, // ← Importante: excluir el turno que estamos editando
+          excludeId: id,
           bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0)
         });
         console.log("   ✅ Sin overlaps");
       } catch (overlapError) {
         console.error("   ❌ Overlap:", overlapError.message);
-        return res.status(409).json({
-          ok: false,
-          error: overlapError.message
-        });
+        return res.status(409).json({ ok: false, error: overlapError.message });
       }
+    }
+
+    // ✅ Validación de seña contra precio del servicio (si viene depositDecimal)
+    if (depositDecimal != null) {
+      const [[svc]] = await pool.query(
+        "SELECT price_decimal FROM service WHERE id=? LIMIT 1",
+        [serviceId]
+      );
+      if (!svc) return res.status(400).json({ ok: false, error: "Servicio inexistente" });
+      const price = Number(svc.price_decimal ?? 0);
+      const dep = Number(depositDecimal);
+      if (Number.isNaN(dep)) return res.status(400).json({ ok: false, error: "Seña inválida" });
+      if (dep < 0) return res.status(400).json({ ok: false, error: "La seña no puede ser negativa" });
+      if (price > 0 && dep > price) {
+        return res.status(400).json({ ok: false, error: "La seña no puede superar el precio del servicio" });
+      }
+    }
+
+    // Armo UPDATE dinámico para deposit_paid_at si corresponde
+    let setPaidAtSQL = "";
+    const params = [
+      newCustomerId,          // 1
+      stylistId,              // 2
+      serviceId,              // 3
+      startMySQL,             // 4
+      endMySQL,               // 5
+      status,                 // 6
+      depositDecimal,         // 7 👈 NUEVO (puede ser null => no cambia)
+      id                      // 8 (WHERE)
+    ];
+
+    if (markDepositAsPaid) {
+      setPaidAtSQL = ", deposit_paid_at = NOW()";
     }
 
     const [r] = await pool.query(
       `UPDATE appointment
-          SET customer_id = COALESCE(?, customer_id),
-              stylist_id  = COALESCE(?, stylist_id),
-              service_id  = COALESCE(?, service_id),
-              starts_at   = COALESCE(?, starts_at),
-              ends_at     = COALESCE(?, ends_at),
-              status      = COALESCE(?, status)
+          SET customer_id     = COALESCE(?, customer_id),
+              stylist_id      = COALESCE(?, stylist_id),
+              service_id      = COALESCE(?, service_id),
+              starts_at       = COALESCE(?, starts_at),
+              ends_at         = COALESCE(?, ends_at),
+              status          = COALESCE(?, status),
+              deposit_decimal = COALESCE(?, deposit_decimal)
+              ${setPaidAtSQL}
         WHERE id = ?`,
-      [newCustomerId, stylistId, serviceId, startMySQL, endMySQL, status, id]
+      params
     );
 
     if (r.affectedRows === 0) {
@@ -498,14 +557,14 @@ appointments.delete("/:id", async (req, res) => {
   try {
     const { id } = req.params;
     console.log(`\n🗑️  [DELETE /appointments/${id}]`);
-    
+
     const [r] = await pool.query(`DELETE FROM appointment WHERE id=?`, [id]);
-    
+
     if (r.affectedRows === 0) {
       console.error("   ❌ Turno no encontrado");
       return res.status(404).json({ ok: false, error: "Turno no encontrado" });
     }
-    
+
     console.log("   ✅ Turno eliminado");
     res.json({ ok: true });
   } catch (e) {
@@ -533,4 +592,11 @@ export async function listUpcomingAppointmentsByPhone(phone_e164, { limit = 5 } 
     [String(phone_e164).replace(/\D/g, ""), limit]
   );
   return rows;
+}
+function withTimeout(promise, ms, label = "timeout") {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(label)), ms);
+    promise.then((v) => { clearTimeout(t); resolve(v); })
+           .catch((e) => { clearTimeout(t); reject(e); });
+  });
 }

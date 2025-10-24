@@ -47,3 +47,27 @@ meta.get("/stylists", async (_req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+meta.put("/stylists/:id/working-hours", async (req, res) => {
+  const id = Number(req.params.id);
+  const { weekday, start_time, end_time } = req.body;
+  await pool.query(
+    `INSERT INTO working_hours (stylist_id, weekday, start_time, end_time)
+     VALUES (?,?,?,?)
+     ON DUPLICATE KEY UPDATE start_time=VALUES(start_time), end_time=VALUES(end_time)`,
+    [id, weekday, start_time, end_time]
+  );
+  res.json({ ok: true });
+});
+
+meta.put("/stylists/:id/commission", async (req, res) => {
+  const id = Number(req.params.id);
+  const { percentage } = req.body;
+  await pool.query(
+    `INSERT INTO stylist_commission (stylist_id, percentage)
+     VALUES (?,?)
+     ON DUPLICATE KEY UPDATE percentage=VALUES(percentage)`,
+    [id, percentage]
+  );
+  res.json({ ok: true });
+});

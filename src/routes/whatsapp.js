@@ -12,7 +12,8 @@ import { listUpcomingAppointmentsByPhone } from "../routes/appointments.js";
 import { getCustomerByPhone, upsertCustomerNameByPhone } from "../routes/customers.js";
 import { validateAppointmentDate, isPastDateTime } from "../helpers/dateValidation.js";
 import { addHours } from "date-fns";
-
+import { pool } from "../db.js";
+import { createDepositPaymentLink } from "../payments.js";
 
 export const whatsapp = Router();
 
@@ -414,59 +415,91 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
           try {
             const fullDateTime = `${session.data.day} ${session.data.hhmm}:00`;
 
-            // ✅ Validación completa antes de crear el turno
+            // Validaciones (ya las tenés)
             try {
               validateAppointmentDate(fullDateTime);
             } catch (validationError) {
-              await sendWhatsAppText(
-                user,
-                `⚠️ ${validationError.message}\n\n` +
-                "Escribí *hola* para empezar de nuevo."
-              );
+              await sendWhatsAppText(user, `⚠️ ${validationError.message}\n\nEscribí *hola* para empezar de nuevo.`);
               reset(user);
               return res.sendStatus(200);
             }
-
-            // ✅ Doble check que no sea pasado (por si acaso)
             if (isPastDateTime(fullDateTime)) {
-              await sendWhatsAppText(
-                user,
-                "⚠️ Ese horario ya pasó mientras elegías.\n\n" +
-                "Escribí *hola* para empezar de nuevo."
-              );
+              await sendWhatsAppText(user, "⚠️ Ese horario ya pasó.\n\nEscribí *hola* para empezar de nuevo.");
               reset(user);
               return res.sendStatus(200);
             }
 
-            await _book(user, session.data.stylist_id, session.data.service_id, fullDateTime);
+            // 1) Traer precio del servicio para calcular seña (50%)
+            const [[svc]] = await pool.query(
+              "SELECT name, price_decimal FROM service WHERE id=? LIMIT 1",
+              [session.data.service_id]
+            );
+            const serviceName = svc?.name || "Servicio";
+            const servicePrice = Number(svc?.price_decimal || 0);
+            const deposit = Math.max(0, Number((servicePrice / 2).toFixed(2)));
+            console.log({
+              user,
+              stylistId: session.data.stylist_id,
+              serviceId: session.data.service_id,
+              startsAt: fullDateTime,
+              deposit
+            });
+            // 2) Crear el turno con la seña en 0 o con el 50% (recomendado guardar el 50%)
+            console.log("[WA] creando turno con seña...");
+            const bookResp = await _bookWithDeposit(user, session.data.stylist_id, session.data.service_id, fullDateTime, deposit);
+
+            console.log("[WA] turno creado:", bookResp);
+
+            // 3) Generar link de pago (Mercado Pago o fallback)
+            let payLink = "";
+            try {
+              payLink = await promiseWithTimeout(
+                createDepositPaymentLink({
+                  amount: deposit,
+                  title: `Seña ${serviceName}`,
+                  externalReference: String(bookResp?.id || ""),
+                  // sin success/failure: usa wa.me
+                  notificationUrl: process.env.WH_URL_MP_WEBHOOK,
+                  payer: { name: "", email: "", phone: user }
+                }),
+                8000 // 8 segundos máx
+              );
+              console.log("[WA] link de pago listo:", payLink);
+            } catch (payErr) {
+              console.warn("[PAY] No se pudo generar link de pago:", payErr?.message);
+            }
+
             reset(user);
-            await sendWhatsAppText(user, "¡Listo! Turno reservado ✅");
+
+            // 4) Mensaje de confirmación + link
+            const d = new Date(fullDateTime.replace(" ", "T"));
+            const fecha = d.toLocaleDateString("es-AR", { weekday: "short", day: "2-digit", month: "2-digit" });
+            const hora = d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
+            const cuerpo =
+              `¡Turno reservado! ✅\n` +
+              `Servicio: *${serviceName}* ($${servicePrice.toFixed(2)})\n` +
+              `Seña (50%): *$${deposit.toFixed(2)}*\n` +
+              `Fecha: *${fecha} ${hora}*\n\n` +
+              (payLink
+                ? `🔗 Pagá la seña acá:\n${payLink}\n\n` +
+                `Tu turno queda confirmado. ¡Gracias!`
+                : `No pude generar el link de pago ahora. Te enviamos uno a la brevedad.`);
+
+            await sendWhatsAppText(user, cuerpo);
           } catch (e) {
-            const m = String(e?.message || "");
-            if (m.includes("pasado")) {
-              await sendWhatsAppText(
-                user,
-                "⚠️ No podés agendar turnos en el pasado.\n\n" +
-                "Escribí *hola* para empezar de nuevo."
-              );
-            } else if (m.includes("MAX_ACTIVE_APPOINTMENTS")) {
-              await sendWhatsAppText(
-                user,
-                "Tenés *2 turnos activos* ya reservados.\n\n" +
-                "Para sacar otro, primero *cancelá* uno de los existentes."
-              );
-            } else if (m.includes("SLOT")) {
-              await sendWhatsAppText(
-                user,
-                "Uff, ese horario se acaba de ocupar 😕\n\n" +
-                "Escribí *hola* para elegir otro."
-              );
+            const m = String(e?.message || "").toLowerCase();
+            if (m.includes("duración del servicio")) {
+              await sendWhatsAppText(user, "⚠️ Falta configurar la *duración* del servicio. Avisanos y lo corregimos enseguida.");
+            } else if (m.includes("horarios definidos")) {
+              await sendWhatsAppText(user, "⚠️ Ese peluquero no tiene *horarios cargados* ese día. Probá otro horario o peluquero.");
+            } else if (m.includes("fuera del horario laboral")) {
+              await sendWhatsAppText(user, "⚠️ Ese horario está *fuera del horario laboral*. Elegí otro.");
+            } else if (m.includes("overlap")) {
+              await sendWhatsAppText(user, "Uff, ese horario se acaba de ocupar 😕 Elegí otro.");
+            } else if (m.includes("pasado")) {
+              await sendWhatsAppText(user, "⚠️ No podés agendar turnos en el pasado.\n\nEscribí *hola* para empezar de nuevo.");
             } else {
-              await sendWhatsAppText(
-                user,
-                "No pude guardar el turno.\n\n" +
-                "Probá de nuevo escribiendo *hola*."
-              );
+              await sendWhatsAppText(user, "No pude guardar el turno.\n\nProbá de nuevo escribiendo *hola*.");
             }
             reset(user);
           }
@@ -481,6 +514,7 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
     await sendWhatsAppText(user, "Mandame texto o usá las opciones 😉");
     return res.sendStatus(200);
   } catch (e) {
+    console.error("[WA confirm_yes] error:", e?.message, e); // 👈 agrega esto
     console.error("[WA webhook] error:", e);
     return res.sendStatus(200);
   }
@@ -523,5 +557,25 @@ async function _book(customerPhoneE164, stylistId, serviceId, startsAtLocal) {
     stylistId,
     serviceId,
     startsAt: startsAtLocal, // "YYYY-MM-DD HH:MM:SS"
+  });
+}
+
+async function _bookWithDeposit(customerPhoneE164, stylistId, serviceId, startsAtLocal, depositDecimal) {
+
+  return createAppointment({
+    customerPhone: customerPhoneE164,
+    stylistId,
+    serviceId,
+    startsAt: startsAtLocal,           // "YYYY-MM-DD HH:MM:SS"
+    depositDecimal: Number(depositDecimal || 0),
+    markDepositAsPaid: false
+  });
+}
+
+function promiseWithTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("timeout")), ms);
+    promise.then((v) => { clearTimeout(t); resolve(v); })
+      .catch((e) => { clearTimeout(t); reject(e); });
   });
 }

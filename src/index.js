@@ -12,6 +12,7 @@ import { customers } from "./routes/customers.js";
 import { adminDashboard } from "./routes/adminDashboard.js";
 import { customersAdmin } from "./routes/customersAdmin.js";
 import { admin as adminRouter } from "./routes/admin.js";
+import { mpWebhook } from "./routes/mpWebhook.js";
 
 
 dotenv.config();
@@ -27,6 +28,8 @@ app.use("/api", availability);
 app.use("/", waTest);
 app.use("/", whatsapp);
 app.use(waTemplates);
+app.use("/api", mpWebhook);
+
 
 // Admin
 app.use("/api/admin/dashboard", adminDashboard); 

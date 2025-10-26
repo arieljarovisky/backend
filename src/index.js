@@ -28,7 +28,8 @@ app.use("/api", availability);
 app.use("/", waTest);
 app.use("/", whatsapp);
 app.use(waTemplates);
-app.use("/api", mpWebhook);
+app.use("/api/mp-webhook", mpWebhook);
+
 
 
 // Admin

@@ -1,22 +1,22 @@
 // src/whatsapp.js
-import { toSandboxAllowed } from "./helpers/numbers.js"; 
+import { toSandboxAllowed } from "./helpers/numbers.js";
 
 const WA_API_VERSION = process.env.WHATSAPP_API_VERSION || "v20.0";
-const WA_PHONE_NUMBER_ID = (process.env.WHATSAPP_PHONE_NUMBER_ID || "").trim();
+const WHATSAPP_PHONE_NUMBER_ID = (process.env.WHATSAPP_PHONE_NUMBER_ID || "").trim();
 const WA_TOKEN = (process.env.WHATSAPP_TOKEN || "").trim();
 const DEFAULT_COUNTRY = (process.env.DEFAULT_COUNTRY_DIAL || "54").replace(/^\+/, ""); // 54 = AR
 const DEBUG = String(process.env.WHATSAPP_DEBUG || "false").toLowerCase() === "true";
 
 
-if (!WA_PHONE_NUMBER_ID || !WA_TOKEN) {
+if (!WHATSAPP_PHONE_NUMBER_ID || !WA_TOKEN) {
   console.error("[WA] Faltan variables de entorno: WHATSAPP_PHONE_NUMBER_ID y/o WHATSAPP_TOKEN");
   // No tiro error duro para no tumbar el server si solo querés desactivar WA
 }
 
-const BASE_URL = `https://graph.facebook.com/${WA_API_VERSION}/${WA_PHONE_NUMBER_ID}`;
+const BASE_URL = `https://graph.facebook.com/${WA_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}`;
 
 /** Normaliza a E.164 numérica. Si no trae prefijo país, agrega DEFAULT_COUNTRY. */
- export function normalizeTo(num) {
+export function normalizeTo(num) {
   // 1) dejá solo dígitos
   const digits = String(num || "").replace(/\D/g, "");
   if (!digits) return "";
@@ -30,7 +30,7 @@ const BASE_URL = `https://graph.facebook.com/${WA_API_VERSION}/${WA_PHONE_NUMBER
 }
 /** Fetch con manejo de errores de Graph */
 async function request(path, body) {
-  if (!WA_PHONE_NUMBER_ID || !WA_TOKEN) {
+  if (!WHATSAPP_PHONE_NUMBER_ID || !WA_TOKEN) {
     if (DEBUG) console.warn("[WA] Saltando envío (sin credenciales):", path, body?.type);
     return { skipped: true };
   }
@@ -70,31 +70,53 @@ async function request(path, body) {
 }
 
 /** ✅ Texto simple */
-export async function sendWhatsAppText(to, text) {
-  const payload = {
-    messaging_product: "whatsapp",
-    to: normalizeTo(to),
-    type: "text",
-    text: { body: String(text) },
-  };
-  return request("/messages", payload);
-}
+export async function sendWhatsAppText(toE164, text) {
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID; // << ID del número de LA EMPRESA
+  const token = process.env.WHATSAPP_TOKEN;
 
-/** ✅ Plantilla (HSM) aprobada en Business Manager */
-export async function sendWhatsAppTemplate(to, templateName, variables = [], lang = "es") {
-  const payload = {
-    messaging_product: "whatsapp",
-    to: normalizeTo(to),
-    type: "template",
-    template: {
-      name: templateName, // ej: recordatorio_turno
-      language: { code: lang }, // "es" | "es_AR" | ...
-      components: variables.length
-        ? [{ type: "body", parameters: variables.map(v => ({ type: "text", text: String(v) })) }]
-        : undefined,
+  if (!phoneNumberId || !token) throw new Error("Faltan WHATSAPP_PHONE_NUMBER_ID o WHATSAPP_TOKEN");
+
+  const resp = await fetch(`https://graph.facebook.com/v20.0/${phoneNumberId}/messages`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
     },
-  };
-  return request("/messages", payload);
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to: String(toE164),            // E.164 (sin + opcional)
+      type: "text",
+      text: { body: text },
+    }),
+  });
+
+  if (!resp.ok) {
+    const errTxt = await resp.text();
+    console.error("[WA] sendText error:", errTxt);
+    throw new Error(`[WA] ${resp.status} ${errTxt}`);
+  }
+}
+/** ✅ Plantilla (HSM) aprobada en Business Manager */
+export async function sendWhatsAppTemplate(toE164, templateName, lang = "es_AR", components = []) {
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  const token = process.env.WHATSAPP_TOKEN;
+
+  const resp = await fetch(`https://graph.facebook.com/v20.0/${phoneNumberId}/messages`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to: String(toE164),
+      type: "template",
+      template: {
+        name: templateName, // ej: payment_confirmation
+        language: { code: lang },
+        components,         // variables si el template las tiene
+      },
+    }),
+  });
+
+  if (!resp.ok) throw new Error(`[WA] ${resp.status} ${await resp.text()}`);
 }
 
 /** ✅ Lista interactiva */

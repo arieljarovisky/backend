@@ -6,7 +6,7 @@ export function toMySQLDateTime(val) {
   const d = (val instanceof Date) ? val : new Date(String(val));
   if (Number.isNaN(d.getTime())) return null;
   const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 export function parseDateTime(s) {
@@ -43,16 +43,19 @@ export async function checkAppointmentOverlap(db, {
   const startStr = toMySQLDateTime(startWithBuffer);
   const endStr   = toMySQLDateTime(endWithBuffer);
 
+  // 🚀 IGNORAMOS CANCELADOS (y otros que no bloqueen horario)
   let sqlAppt = `
     SELECT id
       FROM appointment
      WHERE stylist_id = ?
        AND starts_at < ?
        AND ends_at   > ?
+       AND status IN ('scheduled','confirmed','deposit_paid','completed','pending_deposit')
   `;
+
   const params = [Number(stylistId), endStr, startStr];
   if (excludeId) { sqlAppt += " AND id <> ?"; params.push(Number(excludeId)); }
-  if (useLock)   { sqlAppt += " FOR UPDATE"; }   // ← clave cuando estás en transacción
+  if (useLock)   { sqlAppt += " FOR UPDATE"; }
 
   const [appts] = await db.query(sqlAppt, params);
 

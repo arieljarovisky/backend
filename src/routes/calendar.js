@@ -8,40 +8,47 @@ export const calendar = Router();
  * GET /api/calendar/events
  * Query:
  *  - includePending=0|1  (default 0: oculta pending_deposit y cancelled)
- *  - from=YYYY-MM-DD     (opcional)
- *  - to=YYYY-MM-DD       (opcional)
- *  - stylistId=number    (opcional)
+ *  - from=YYYY-MM-DD | ISO (opcional)
+ *  - to=YYYY-MM-DD   | ISO (opcional)
+ *  - stylistId=number (opcional)
  */
 calendar.get("/events", async (req, res) => {
   try {
     const includePending = req.query.includePending === "1";
     const { from, to, stylistId } = req.query;
 
-    // Estados a incluir por defecto
+    // Estados visibles por defecto (NO incluye cancelled)
     const baseStatuses = ["confirmed", "deposit_paid", "completed", "scheduled"];
-    const statuses = includePending
-      ? [...baseStatuses, "pending_deposit"] // opcional si todavía usás 'scheduled'
-      : baseStatuses;
+    const statuses = includePending ? [...baseStatuses, "pending_deposit"] : baseStatuses;
 
     const where = [];
     const params = [];
 
-    // Rango de fechas (opcional). Si no lo mandás, traemos próximo mes por defecto.
-    if (from && to) {
+    // Normaliza fechas: si viene ISO, MySQL igual entiende 'YYYY-MM-DDTHH:mm:ssZ',
+    // pero preferimos recortar a día.
+    const normDay = (s) => {
+      if (!s) return s;
+      // acepta ISO o 'YYYY-MM-DD'
+      const day = String(s).slice(0, 10);
+      return /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : null;
+    };
+
+    const fromDay = normDay(from);
+    const toDay = normDay(to);
+
+    if (fromDay && toDay) {
       where.push("a.starts_at BETWEEN ? AND ?");
-      params.push(`${from} 00:00:00`, `${to} 23:59:59`);
+      params.push(`${fromDay} 00:00:00`, `${toDay} 23:59:59`);
     } else {
-      // por defecto: desde hoy - 7d hasta hoy + 60d
+      // por defecto: desde hoy -7d hasta hoy +60d
       where.push("a.starts_at BETWEEN DATE_SUB(NOW(), INTERVAL 7 DAY) AND DATE_ADD(NOW(), INTERVAL 60 DAY)");
     }
 
-    // Filtrar por estilista (opcional)
     if (stylistId) {
       where.push("a.stylist_id = ?");
       params.push(Number(stylistId));
     }
 
-    // Filtrar por estados
     where.push(`a.status IN (${statuses.map(() => "?").join(",")})`);
     params.push(...statuses);
 
@@ -50,9 +57,13 @@ calendar.get("/events", async (req, res) => {
         a.id,
         a.starts_at, a.ends_at, a.status,
         a.deposit_decimal, a.deposit_paid_at,
-        c.name  AS customer_name,
+        a.service_id, a.stylist_id,
         s.name  AS service_name,
-        st.name AS stylist_name
+        s.duration_min,
+        st.name AS stylist_name,
+        st.color_hex,
+        c.name  AS customer_name,
+        c.phone_e164
       FROM appointment a
       JOIN customer c ON c.id = a.customer_id
       JOIN service  s ON s.id = a.service_id
@@ -63,20 +74,28 @@ calendar.get("/events", async (req, res) => {
 
     const [rows] = await pool.query(sql, params);
 
-    // Map a formato FullCalendar
-    const events = rows.map(r => ({
+    const events = rows.map((r) => ({
       id: r.id,
       title: `${r.service_name} • ${r.customer_name ?? "Cliente"}`,
-      start: r.starts_at, // FullCalendar acepta 'YYYY-MM-DD HH:MM:SS'
-      end:   r.ends_at,
+      start: r.starts_at, // 'YYYY-MM-DD HH:MM:SS' ok para FullCalendar
+      end: r.ends_at,
       extendedProps: {
+        // estado / pago
         status: r.status,
         deposit_decimal: r.deposit_decimal,
         deposit_paid_at: r.deposit_paid_at,
+        // ids para re-agendar
+        service_id: r.service_id,
+        stylist_id: r.stylist_id,
+        // meta de front
+        duration_min: r.duration_min,
         service_name: r.service_name,
         stylist_name: r.stylist_name,
-        customer_name: r.customer_name
-      }
+        color_hex: r.color_hex,
+        // cliente (WhatsApp, etc.)
+        customer_name: r.customer_name,
+        phone_e164: r.phone_e164,
+      },
     }));
 
     res.json({ ok: true, events });
@@ -86,5 +105,4 @@ calendar.get("/events", async (req, res) => {
   }
 });
 
-
-export default calendar; 
+export default calendar;

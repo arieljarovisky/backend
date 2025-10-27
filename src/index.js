@@ -21,25 +21,23 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-app.use("/api", customers);  
+// ────── API públicas ──────
+app.use("/api", customers);
 app.use("/api", health);
 app.use("/api", meta);
-app.use("/api/appointments", appointments);
 app.use("/api", availability);
+app.use("/api/appointments", appointments);
+app.use("/api/calendar", calendar);
+app.use("/api/mp-webhook", mpWebhook);
+app.use("/api/whatsapp", whatsapp);
 app.use("/", waTest);
 app.use("/", whatsapp);
 app.use(waTemplates);
-app.use("/api/calendar", calendar);   
-app.use("/api/mp-webhook", mpWebhook);
-app.use("/api/whatsapp", whatsapp);
 
-
-
-// Admin
-app.use("/api/admin/dashboard", adminDashboard); 
+// ────── API Admin ──────
+app.use("/api/admin", adminDashboard);   // ← Dashboard y KPIs
 app.use("/api/admin/customers", customersAdmin);
-app.use("/api/admin", adminRouter);  
-
+app.use("/api/admin", adminRouter);
 const port = process.env.PORT || 4000;
 app.listen(port, () => console.log(`API ready on http://localhost:${port}`));
 

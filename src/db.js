@@ -8,6 +8,7 @@ export const pool = createPool({
   password: process.env.DB_PASS,
   database: process.env.DB_NAME,
   waitForConnections: true,
+  decimalNumbers: true,
   connectionLimit: 10,
   timezone: "-03:00"
 });

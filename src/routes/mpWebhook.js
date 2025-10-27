@@ -1,7 +1,7 @@
 // src/routes/mpWebhook.js
 import { Router } from "express";
 import { pool } from "../db.js";
-import { sendWhatsAppText /*, sendWhatsAppTemplate*/ } from "../whatsapp.js";
+import { sendWhatsAppText } from "../whatsapp.js";
 
 export const mpWebhook = Router();
 
@@ -9,19 +9,14 @@ mpWebhook.get("/", (req, res) => res.sendStatus(200));
 
 mpWebhook.post("/", async (req, res) => {
   console.log("[MP Webhook] body:", JSON.stringify(req.body, null, 2));
-
   try {
     const body = req.body || {};
 
-    // === 1) Detectar paymentId y estado del payload entrante (MP manda mil variantes) ===
     const paymentId =
       body?.data?.id || body?.id || body?.resource?.split?.("/")?.pop?.() || null;
     const status = body?.data?.status || body?.status || null;
-
-    // appointment_id si vos lo mandás en tu webhook interno (si no, luego lo deducimos por external_reference al consultar MP)
     const appointmentIdInBody = body?.appointment_id || null;
 
-    // Log básico (idempotente por payment_id)
     if (paymentId) {
       await pool.query(
         `INSERT INTO mp_webhook_log (payment_id, appointment_id, status, created_at)
@@ -33,9 +28,7 @@ mpWebhook.post("/", async (req, res) => {
       );
     }
 
-    // === 2) Disparamos el procesador (reintenta y deja trazas en processed_at / error_message) ===
     await processPendingLogs({ onlyPaymentId: paymentId });
-
     return res.sendStatus(200);
   } catch (e) {
     console.error("[MP Webhook] Error general:", e?.message, e);
@@ -43,12 +36,10 @@ mpWebhook.post("/", async (req, res) => {
   }
 });
 
-// ===== Procesador de logs pendientes =====
 async function processPendingLogs({ onlyPaymentId = null } = {}) {
   const where = onlyPaymentId
     ? "WHERE l.payment_id = ? AND l.processed_at IS NULL"
     : "WHERE l.processed_at IS NULL";
-
   const params = onlyPaymentId ? [String(onlyPaymentId)] : [];
 
   const [rows] = await pool.query(
@@ -59,7 +50,6 @@ async function processPendingLogs({ onlyPaymentId = null } = {}) {
        LIMIT 50`,
     params
   );
-
   if (!rows.length) {
     console.log("[MP->PROC] No hay pagos pendientes por procesar");
     return;
@@ -70,7 +60,7 @@ async function processPendingLogs({ onlyPaymentId = null } = {}) {
     console.log(`\n[MP->PROC] === Iniciando pago ${paymentId} ===`);
 
     try {
-      // 1) Leer pago de MP
+      // 1) Obtener pago real desde MP
       let pay = null, amount = null, externalRef = null;
       try {
         const token = process.env.MP_ACCESS_TOKEN;
@@ -90,7 +80,7 @@ async function processPendingLogs({ onlyPaymentId = null } = {}) {
         console.error(`[MP->PROC] Error leyendo MP ${paymentId}:`, e.message);
       }
 
-      // 1.1) Debe estar aprobado
+      // 1.1) Solo aprobados
       const approved = (pay?.status || "").toLowerCase() === "approved";
       if (!approved) {
         await pool.query(
@@ -101,27 +91,27 @@ async function processPendingLogs({ onlyPaymentId = null } = {}) {
            WHERE payment_id = ?`,
           [pay?.status || row.status || null, paymentId]
         );
-        console.log(`[MP->PROC] Pago ${paymentId} NO aprobado (${pay?.status}). Marcado como procesado y omitido.`);
+        console.log(`[MP->PROC] Pago ${paymentId} NO aprobado (${pay?.status}). Omitido.`);
         continue;
       }
 
-      // 2) Resolver appointment_id
-      const appointmentId = row.appointment_id || externalRef;
-      if (!appointmentId) {
-        throw new Error("No pude determinar appointment_id (faltan appointment_id y external_reference).");
+      // 2) appointment_id
+      const appointmentId = row.appointment_id || (externalRef ? Number(externalRef) : null);
+      if (!appointmentId || Number.isNaN(appointmentId)) {
+        throw new Error("No pude determinar appointment_id (external_reference inválido).");
       }
       console.log(`[MP->PROC] appointment_id=${appointmentId}`);
 
-      // 3) Traer datos del turno (ANTES del update)
+      // 3) Datos del turno
       const [[ap]] = await pool.query(
         `SELECT a.id, a.starts_at, a.status, a.deposit_decimal, a.deposit_paid_at,
-          s.name AS service_name, st.name AS stylist_name,
-          c.phone_e164 AS phone, c.name AS customer_name
-     FROM appointment a
-     JOIN service  s  ON s.id  = a.service_id
-     JOIN stylist  st ON st.id = a.stylist_id
-     JOIN customer c  ON c.id  = a.customer_id
-    WHERE a.id = ?`,
+                s.name AS service_name, st.name AS stylist_name,
+                c.phone_e164 AS phone, c.name AS customer_name
+           FROM appointment a
+           JOIN service  s  ON s.id  = a.service_id
+           JOIN stylist  st ON st.id = a.stylist_id
+           JOIN customer c  ON c.id  = a.customer_id
+          WHERE a.id = ?`,
         [appointmentId]
       );
       if (!ap) throw new Error(`Turno ${appointmentId} no encontrado.`);
@@ -129,21 +119,21 @@ async function processPendingLogs({ onlyPaymentId = null } = {}) {
       const wasPending = ap.status === "pending_deposit";
       const hadPaidAt = Boolean(ap.deposit_paid_at);
 
-      // 4) Actualizar turno (status + depósito + paid_at)
-      const updParams = [];
-      let setDeposit = "";
-      if (amount != null) { setDeposit = ", deposit_decimal = COALESCE(deposit_decimal, 0) + ?"; updParams.push(amount); }
-
-      const [upd] = await pool.query(
+      // 4) Update idempotente (ver punto 2)
+      const setStatusTo = 'deposit_paid'; // o 'confirmed'
+      await pool.query(
         `UPDATE appointment
-      SET status = CASE WHEN status = 'pending_deposit' THEN 'scheduled' ELSE status END
-          ${setDeposit},
-          deposit_paid_at = COALESCE(deposit_paid_at, NOW())
-    WHERE id = ?`,
-        [...updParams, appointmentId]
+            SET status = CASE WHEN status = 'pending_deposit' THEN ? ELSE status END,
+                deposit_decimal = COALESCE(deposit_decimal, ?),
+                deposit_paid_at = COALESCE(deposit_paid_at, NOW()),
+                hold_until = NULL,
+                mp_payment_id = COALESCE(mp_payment_id, ?),
+                mp_payment_status = ?
+          WHERE id = ?`,
+        [setStatusTo, amount ?? null, paymentId, (pay?.status || row.status || null), appointmentId]
       );
 
-      // 5) WhatsApp SOLO si recién se confirmó
+      // 5) WhatsApp solo si “recién confirmado”
       const justConfirmed = wasPending || !hadPaidAt;
       if (justConfirmed) {
         const d = new Date(ap.starts_at);
@@ -158,40 +148,35 @@ async function processPendingLogs({ onlyPaymentId = null } = {}) {
           `• Peluquero: *${ap.stylist_name}*\n` +
           `• Fecha: *${fecha} ${hora}*${montoTxt}\n\n` +
           `Te esperamos 💈`;
-        try { if (ap.phone) await sendWhatsAppText(ap.phone, msg); } catch { }
+        try { if (ap.phone) await sendWhatsAppText(ap.phone, msg); } catch {}
       }
-      // 6) Marcar log como procesado SIEMPRE (aunque falle WA)
+
+      // 6) Log → processed
       await pool.query(
         `UPDATE mp_webhook_log
-           SET appointment_id = COALESCE(appointment_id, ?),
-               status = 'approved',
-               processed_at = NOW(),
-               error_message = NULL
-         WHERE payment_id = ?`,
+            SET appointment_id = COALESCE(appointment_id, ?),
+                status = 'approved',
+                processed_at = NOW(),
+                error_message = NULL
+          WHERE payment_id = ?`,
         [appointmentId, paymentId]
       );
       console.log(`[MP->PROC] Marcado processed_at OK para ${paymentId}`);
 
     } catch (err) {
       console.error(`[MP->PROC] Error con payment_id ${paymentId}:`, err.message);
-      // Guardamos el error pero no seteamos processed_at para poder reintentar
       await pool.query(
         `UPDATE mp_webhook_log
-           SET error_message = ?
-         WHERE payment_id = ?`,
+            SET error_message = ?
+          WHERE payment_id = ?`,
         [String(err?.message || err), paymentId]
       );
     }
   }
 }
 
-
-// ===== (OPCIONAL) endpoint para reintentar manualmente desde el navegador/Postman =====
-mpWebhook.post("/reprocess", async (req, res) => {
-  try {
-    await processPendingLogs();
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
+// Reproceso manual
+mpWebhook.post("/reprocess", async (_req, res) => {
+  try { await processPendingLogs(); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });

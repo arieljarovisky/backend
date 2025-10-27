@@ -520,6 +520,59 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
   }
 });
 
+whatsapp.post("/reprogram", async (req, res) => {
+  try {
+    const { appointmentId, customText, autoCancel } = req.body || {};
+    if (!appointmentId) {
+      return res.status(400).json({ ok: false, error: "Falta appointmentId" });
+    }
+
+    const [[a]] = await pool.query(
+      `SELECT a.id, a.starts_at, a.status,
+              s.name AS service_name, st.name AS stylist_name,
+              c.name AS customer_name, c.phone_e164
+         FROM appointment a
+         JOIN customer c ON c.id=a.customer_id
+         JOIN service  s ON s.id=a.service_id
+         JOIN stylist st ON st.id=a.stylist_id
+        WHERE a.id=? LIMIT 1`,
+      [appointmentId]
+    );
+    if (!a) return res.status(404).json({ ok: false, error: "Turno no encontrado" });
+    if (!a.phone_e164) return res.status(400).json({ ok: false, error: "El cliente no tiene WhatsApp registrado" });
+
+    const d = new Date(a.starts_at);
+    const fecha = d.toLocaleDateString("es-AR", { weekday: "short", day: "2-digit", month: "2-digit" });
+    const hora = d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
+
+    const msg =
+      customText ||
+      `Hola ${a.customer_name || ""}! 💈\n` +
+      `Desde la peluquería necesitamos *reprogramar tu turno* de:\n` +
+      `• Servicio: *${a.service_name}*\n` +
+      `• Peluquero: *${a.stylist_name}*\n` +
+      `• Fecha: *${fecha} ${hora}*\n\n` +
+      `Por favor, respondé este mensaje para coordinar una nueva fecha. ¡Gracias! 🙏`;
+
+    await sendWhatsAppText(a.phone_e164, msg);
+
+    // ✅ Cancela el turno viejo para liberar el hueco (y ocultarlo del calendario)
+    if (autoCancel === true) {
+      await pool.query(
+        `UPDATE appointment
+            SET status='cancelled'
+          WHERE id=?`,
+        [appointmentId]
+      );
+    }
+
+    res.json({ ok: true, cancelled: autoCancel === true });
+  } catch (e) {
+    console.error("[/api/whatsapp/reprogram] error:", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ============================================
 // Adaptadores a servicios existentes
 // ============================================

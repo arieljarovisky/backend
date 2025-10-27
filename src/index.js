@@ -13,6 +13,7 @@ import { adminDashboard } from "./routes/adminDashboard.js";
 import { customersAdmin } from "./routes/customersAdmin.js";
 import { admin as adminRouter } from "./routes/admin.js";
 import { mpWebhook } from "./routes/mpWebhook.js";
+import { calendar } from "./routes/calendar.js";
 
 
 dotenv.config();
@@ -28,7 +29,9 @@ app.use("/api", availability);
 app.use("/", waTest);
 app.use("/", whatsapp);
 app.use(waTemplates);
+app.use("/api/calendar", calendar);   
 app.use("/api/mp-webhook", mpWebhook);
+app.use("/api/whatsapp", whatsapp);
 
 
 

@@ -121,22 +121,42 @@ export async function createAppointment({
   serviceId,
   startsAt,
   endsAt = null,
-  status = "scheduled",          // 👈 ahora respetamos el status que venga
+  status = "scheduled",     // respetamos si viene uno válido
   durationMin = null,
-  depositDecimal = 0,            // 👈 seña
-  markDepositAsPaid = false
+  depositDecimal = 0,       // monto de seña en moneda
+  markDepositAsPaid = false // true si ya vino pagada (caso backoffice)
 }) {
   if (!customerPhone || !stylistId || !serviceId || !startsAt) {
     throw new Error("Faltan campos requeridos");
   }
 
+  const STATUS = {
+    SCHEDULED: "scheduled",
+    PENDING: "pending_deposit",
+    DEPOSIT_PAID: "deposit_paid",
+    CONFIRMED: "confirmed",
+    COMPLETED: "completed",
+    CANCELLED: "cancelled",
+  };
+  const ALLOWED = new Set(Object.values(STATUS));
+
+
+  // normaliza estados de versiones anteriores
+  const normalizeStatus = (s) => {
+    const t = String(s || "").toLowerCase().trim();
+    if (t === "deposit_pending") return STATUS.PENDING; // alias viejo
+    return ALLOWED.has(t) ? t : STATUS.SCHEDULED;
+  };
+
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
-    console.log("[createAppointment] IN", { stylistId, serviceId, startsAt, status, depositDecimal });
+    console.log("[createAppointment] IN", {
+      stylistId, serviceId, startsAt, status, depositDecimal, markDepositAsPaid
+    });
 
-    // upsert cliente
+    // 1) upsert cliente
     await conn.query(
       `INSERT INTO customer (name, phone_e164)
        VALUES (?, ?)
@@ -148,10 +168,9 @@ export async function createAppointment({
       [normPhone(customerPhone)]
     );
 
+    // 2) fechas (MySQL)
     const startMySQL = anyToMySQL(startsAt);
     if (!startMySQL) throw new Error("Fecha/hora inválida");
-
-    // calcular fin si hace falta
     let endMySQL = anyToMySQL(endsAt);
     if (!endMySQL) {
       const dur = await resolveServiceDuration(serviceId, durationMin, conn);
@@ -163,18 +182,19 @@ export async function createAppointment({
       endMySQL = anyToMySQL(calc_end);
     }
 
-    // horario laboral
+    // 3) horario laboral
     const dateStr = startMySQL.slice(0, 10);
     const wh = await getWorkingHoursForDate(stylistId, dateStr, conn);
     if (!wh) throw new Error("El peluquero no tiene horarios definidos para ese día");
 
     const startDate = new Date(startMySQL.replace(" ", "T"));
     const endDate = new Date(endMySQL.replace(" ", "T"));
+
     if (!insideWorkingHours(dateStr, wh.start_time, wh.end_time, startDate, endDate)) {
       throw new Error("Fuera del horario laboral");
     }
 
-    // overlap (mantené el mismo contrato que usás en PUT: con pool)
+    // 4) solapamientos
     await checkAppointmentOverlap(pool, {
       stylistId: Number(stylistId),
       startTime: startDate,
@@ -182,29 +202,84 @@ export async function createAppointment({
       bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0)
     });
 
-    // hold si está pendiente de seña
-    let holdUntil = null;
-    if (String(status) === "pending_deposit") {
-      const holdMin = Number(process.env.DEPOSIT_HOLD_MIN || 30); // default 30'
-      const [[{ hu }]] = await conn.query(
-        "SELECT DATE_ADD(NOW(), INTERVAL ? MINUTE) AS hu",
-        [holdMin]
-      );
-      holdUntil = anyToMySQL(hu);
+    // 5) decidir estado final y hold_until
+    const rawStatus = normalizeStatus(status);
+    const wantsDeposit = Number(depositDecimal) > 0;
+
+    // si ya viene pagada la seña -> deposit_paid
+
+    let finalStatus = markDepositAsPaid
+      ? STATUS.DEPOSIT_PAID
+      : wantsDeposit ? STATUS.PENDING : rawStatus;
+
+    // si el estado que vino no es compatible con depósito, ajusto
+
+    if (!wantsDeposit && finalStatus === STATUS.PENDING) finalStatus = STATUS.SCHEDULED;
+    if (!wantsDeposit && finalStatus === STATUS.SCHEDULED) finalStatus = STATUS.CONFIRMED;
+    // si no usás "scheduled", podés convertirlo a "confirmed" directamente
+    if (!wantsDeposit && finalStatus === STATUS.SCHEDULED) {
+      finalStatus = STATUS.CONFIRMED;
     }
 
-    // insert
-    const paidAt = markDepositAsPaid ? new Date() : null;
+
+
+    // hold_until: expira la reserva si no seña a tiempo
+    let holdUntil = null;
+    if (finalStatus === STATUS.PENDING) {
+      const HOLD_MIN = Number(process.env.DEPOSIT_HOLD_MIN || 30);             // ej. 30'
+      const EXPIRE_BEFORE_START_MIN = Number(process.env.DEPOSIT_EXPIRE_BEFORE_START_MIN || 120); // ej. 120'
+      const [[{ hu_grace }]] = await conn.query(
+        "SELECT DATE_ADD(NOW(), INTERVAL ? MINUTE) AS hu_grace",
+        [HOLD_MIN]
+      );
+      // si falta poco para el turno, expira antes
+      const [[{ hu_by_start }]] = await conn.query(
+        "SELECT DATE_SUB(STR_TO_DATE(?, '%Y-%m-%d %H:%i:%s'), INTERVAL ? MINUTE) AS hu_by_start",
+        [startMySQL, EXPIRE_BEFORE_START_MIN]
+      );
+      // elegimos el mínimo positivo
+      const grace = new Date(anyToMySQL(hu_grace).replace(" ", "T"));
+      const byStart = new Date(anyToMySQL(hu_by_start).replace(" ", "T"));
+      holdUntil = anyToMySQL(new Date(Math.min(grace.getTime(), byStart.getTime())));
+    }
+
+    // 6) campos de pago
+    const depositPaidAt = markDepositAsPaid ? anyToMySQL(new Date()) : null;
+
+    // 7) insert
     const [r] = await conn.query(
       `INSERT INTO appointment
-         (customer_id, stylist_id, service_id, deposit_decimal, starts_at, ends_at, status, hold_until, ${paidAt ? "deposit_paid_at," : ""} created_at)
-       VALUES (?,?,?,?,?,?, ?, ?, ${paidAt ? "?," : ""} NOW())`,
-      [cust.id, Number(stylistId), Number(serviceId), Number(depositDecimal || 0), startMySQL, endMySQL, status, holdUntil, ...(paidAt ? [anyToMySQL(paidAt)] : [])]
+     (customer_id, stylist_id, service_id,
+      deposit_decimal, starts_at, ends_at,
+      status, hold_until, deposit_paid_at, created_at)
+   VALUES (?,?,?,?,?,?, ?, ?, ?, NOW())`,
+      [
+        cust.id, Number(stylistId), Number(serviceId),
+        Number(depositDecimal || 0), startMySQL, endMySQL,
+        finalStatus, holdUntil, depositPaidAt
+      ]
     );
 
+    const appointmentId = r.insertId;
+
     await conn.commit();
-    console.log("[createAppointment] OUT", r.insertId);
-    return { ok: true, id: r.insertId };
+    console.log("[createAppointment] OUT", appointmentId);
+
+    // Si requiere seña, afuera (o acá) generás el link de pago de MP
+    // const mp = wantsDeposit && !markDepositAsPaid
+    //   ? await createDepositPaymentLink({ appointmentId, amount: depositDecimal, /*...*/ })
+    //   : null;
+
+    return {
+      ok: true,
+      id: appointmentId,
+      status: finalStatus,
+      deposit: wantsDeposit ? {
+        required: true,
+        amount: Number(depositDecimal),
+        // init_point: mp?.init_point || null
+      } : { required: false }
+    };
   } catch (e) {
     console.error("[createAppointment] ERROR:", e?.message);
     await conn.rollback();
@@ -248,163 +323,47 @@ appointments.get("/", async (req, res) => {
 
 /* -------- POST /api/appointments -------- */
 appointments.post("/", async (req, res) => {
-  const {
-    customerName, customerPhone,
-    stylistId, serviceId,
-    startsAt, endsAt,
-    status = "scheduled",
-    durationMin
-  } = req.body;
-
-  console.log("\n🆕 [POST /appointments] Nueva solicitud:");
-  console.log("   Phone:", customerPhone);
-  console.log("   Stylist:", stylistId);
-  console.log("   Service:", serviceId);
-  console.log("   StartsAt:", startsAt);
-
-  if (!customerPhone || !stylistId || !serviceId || !startsAt) {
-    return res.status(400).json({ ok: false, error: "Faltan campos requeridos" });
-  }
-
-  const conn = await pool.getConnection();
-  let createdId = null;
-  let startMySQL = null;
-  let endMySQL = null;
-
   try {
-    await conn.beginTransaction();
+    const {
+      customerName, customerPhone,
+      stylistId, serviceId,
+      startsAt, endsAt,
+      status = "scheduled",     // puede venir del FE (ej. "pending_deposit")
+      durationMin,
+      depositDecimal,           // opcional: si el FE ya lo manda
+      markDepositAsPaid = false // opcional
+    } = req.body || {};
 
-    startMySQL = anyToMySQL(startsAt);
-    if (!startMySQL) throw new Error("Fecha/hora inválida");
-
-    console.log("   Fecha normalizada:", startMySQL);
-
-    // ✅ VALIDAR FECHA ANTES DE TODO
-    try {
-      validateAppointmentDate(startMySQL);
-      console.log("   ✅ Validación de fecha OK");
-    } catch (validationError) {
-      console.error("   ❌ Fecha inválida:", validationError.message);
-      return res.status(400).json({
-        ok: false,
-        error: validationError.message
-      });
+    // Validación básica antes de delegar
+    if (!customerPhone || !stylistId || !serviceId || !startsAt) {
+      return res.status(400).json({ ok: false, error: "Faltan campos requeridos" });
     }
 
-    // Upsert cliente
-    await conn.query(
-      `INSERT INTO customer (name, phone_e164)
-       VALUES (?, ?)
-       ON DUPLICATE KEY UPDATE name = COALESCE(VALUES(name), name)`,
-      [customerName ?? null, normPhone(customerPhone)]
-    );
-
-    const [[cust]] = await conn.query(
-      `SELECT id, name, phone_e164 FROM customer WHERE phone_e164=? LIMIT 1`,
-      [normPhone(customerPhone)]
-    );
-    if (!cust) throw new Error("No se pudo obtener el cliente");
-
-    console.log("   ✅ Cliente:", cust.id);
-
-    // Calcular fin si no viene
-    endMySQL = anyToMySQL(endsAt);
-    if (!endMySQL) {
-      let dur = null;
-      try {
-        const [[row]] = await conn.query(
-          "SELECT duration_min FROM service WHERE id=? LIMIT 1",
-          [serviceId]
-        );
-        if (row && row.duration_min != null) dur = Number(row.duration_min);
-      } catch { }
-      if (dur == null && durationMin != null) dur = Number(durationMin);
-      if (!dur) throw new Error("No se pudo determinar la duración del servicio");
-
-      const [[{ calc_end }]] = await conn.query(
-        "SELECT DATE_ADD(STR_TO_DATE(?, '%Y-%m-%d %H:%i:%s'), INTERVAL ? MINUTE) AS calc_end",
-        [startMySQL, dur]
-      );
-      endMySQL = anyToMySQL(calc_end);
-    }
-
-    console.log("   Inicio:", startMySQL);
-    console.log("   Fin:", endMySQL);
-
-    // Validar horarios de trabajo
-    const dateStr = startMySQL.slice(0, 10);
-    const wh = await getWorkingHoursForDate(stylistId, dateStr);
-    if (!wh) throw new Error("El peluquero no tiene horarios definidos para ese día");
-
-    const startDate = new Date(startMySQL.replace(" ", "T"));
-    const endDate = new Date(endMySQL.replace(" ", "T"));
-
-    if (!insideWorkingHours(dateStr, wh.start_time, wh.end_time, startDate, endDate)) {
-      throw new Error("Fuera del horario laboral");
-    }
-
-    console.log("   ✅ Dentro del horario laboral");
-
-    // ✅ VALIDACIÓN ROBUSTA DE OVERLAP
-    try {
-      await checkAppointmentOverlap(conn, {
-        stylistId: Number(stylistId),
-        startTime: startDate,
-        endTime: endDate,
-        bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0)
-      });
-      console.log("   ✅ Sin overlaps");
-    } catch (overlapError) {
-      console.error("   ❌ Overlap detectado:", overlapError.message);
-      await conn.rollback();
-      conn.release();
-      return res.status(409).json({
-        ok: false,
-        error: overlapError.message
-      });
-    }
-
-    // Insertar turno
-    const [r] = await conn.query(
-      `INSERT INTO appointment (customer_id, stylist_id, service_id, starts_at, ends_at, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-      [cust.id, Number(stylistId), Number(serviceId), startMySQL, endMySQL, status]
-    );
-    createdId = r.insertId;
-
-    await conn.commit();
-    console.log("   ✅ Turno creado con ID:", createdId);
-
-    res.status(201).json({ ok: true, id: createdId });
-
-    // WhatsApp en segundo plano (sin await)
-    queueMicrotask(async () => {
-      try {
-        const [[srv]] = await pool.query("SELECT name FROM service WHERE id=?", [serviceId]);
-        const [[sty]] = await pool.query("SELECT name FROM stylist WHERE id=?", [stylistId]);
-        if (sendWhatsAppText) {
-          const d = new Date(startMySQL.replace(" ", "T"));
-          const fecha = d.toLocaleDateString("es-AR", { weekday: "short", day: "2-digit", month: "2-digit" });
-          const hora = d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
-          const msg =
-            `¡Turno reservado! ✅\n` +
-            `Servicio: *${srv?.name || ""}*\n` +
-            `Peluquero/a: *${sty?.name || ""}*\n` +
-            `Fecha: *${fecha} ${hora}*`;
-          await sendWhatsAppText(cust.phone_e164, msg);
-          console.log("   📱 WhatsApp enviado");
-        }
-      } catch (waErr) {
-        console.warn("   ⚠️  WA error:", waErr?.message);
-      }
+    // ✅ Reutilizamos la lógica robusta arriba
+    const result = await createAppointment({
+      customerPhone,
+      customerName,
+      stylistId,
+      serviceId,
+      startsAt,
+      endsAt,
+      status,            // será normalizado adentro
+      durationMin,
+      depositDecimal: depositDecimal ?? 0,
+      markDepositAsPaid: Boolean(markDepositAsPaid)
     });
 
+    // Podés sumar aquí la generación del link de pago y adjuntarlo al response
+    // si tu createAppointment no lo hace:
+    // if (result.status === "pending_deposit" && !markDepositAsPaid) {
+    //   const mp = await createDepositPaymentLink({ appointmentId: result.id, amount: result.deposit.amount });
+    //   result.deposit.init_point = mp?.init_point || null;
+    // }
+
+    return res.status(201).json(result);
   } catch (e) {
-    await conn.rollback();
     console.error("   ❌ Error general:", e.message);
     return res.status(400).json({ ok: false, error: e.message });
-  } finally {
-    conn.release();
   }
 });
 
@@ -459,18 +418,33 @@ appointments.put("/:id", async (req, res) => {
       }
     }
 
-    // Si no viene fin, lo calculo con duración (del servicio efectivo)
-    if (!endMySQL && (startMySQL || serviceId || durationMin != null)) {
-      const dur = await resolveServiceDuration(serviceId, durationMin);
-      if (!dur || !startMySQL) {
-        return res.status(400).json({ ok: false, error: "No se pudo determinar la duración/fecha" });
+    // ✅ Si no viene fin, intentamos recalcular con la duración y el INICIO EFECTIVO
+    if (!endMySQL) {
+      // inicio efectivo: el nuevo (si lo mandaron) o el actual
+      const effectiveStart = startMySQL || current.starts_at;
+
+      // ¿Necesitamos recalcular? solo si cambió el inicio o el servicio, o si piden durationMin
+      const mustRecalc =
+        Boolean(startMySQL) || Boolean(b.serviceId ?? b.service_id) || durationMin != null;
+
+      if (mustRecalc) {
+        const dur = await resolveServiceDuration(serviceId, durationMin);
+        if (dur && effectiveStart) {
+          const [[{ calc_end }]] = await pool.query(
+            "SELECT DATE_ADD(STR_TO_DATE(?, '%Y-%m-%d %H:%i:%s'), INTERVAL ? MINUTE) AS calc_end",
+            [anyToMySQL(effectiveStart), Number(dur)]
+          );
+          endMySQL = anyToMySQL(calc_end);
+        } else {
+          // Si no hay datos para recalcular, NO errores: mantené el fin actual
+          endMySQL = current.ends_at;
+        }
+      } else {
+        // No hace falta recalcular: mantené el fin actual
+        endMySQL = current.ends_at;
       }
-      const [[{ calc_end }]] = await pool.query(
-        "SELECT DATE_ADD(STR_TO_DATE(?, '%Y-%m-%d %H:%i:%s'), INTERVAL ? MINUTE) AS calc_end",
-        [startMySQL, dur]
-      );
-      endMySQL = anyToMySQL(calc_end);
     }
+
 
     // Validar horarios y overlaps si cambia rango (inicio/fin)
     if (startMySQL && endMySQL) {

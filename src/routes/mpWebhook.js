@@ -23,8 +23,8 @@ mpWebhook.post("/", async (req, res) => {
          VALUES (?, ?, ?, NOW())
          ON DUPLICATE KEY UPDATE
            status = VALUES(status),
-           appointment_id = COALESCE(VALUES(appointment_id), appointment_id)`
-        , [String(paymentId), appointmentIdInBody, status || null]
+           appointment_id = COALESCE(VALUES(appointment_id), appointment_id)`,
+        [String(paymentId), appointmentIdInBody, status || null]
       );
     }
 
@@ -95,7 +95,7 @@ async function processPendingLogs({ onlyPaymentId = null } = {}) {
         continue;
       }
 
-      // 2) appointment_id
+      // 2) appointment_id (por log o por external_reference)
       const appointmentId = row.appointment_id || (externalRef ? Number(externalRef) : null);
       if (!appointmentId || Number.isNaN(appointmentId)) {
         throw new Error("No pude determinar appointment_id (external_reference inválido).");
@@ -119,8 +119,41 @@ async function processPendingLogs({ onlyPaymentId = null } = {}) {
       const wasPending = ap.status === "pending_deposit";
       const hadPaidAt = Boolean(ap.deposit_paid_at);
 
-      // 4) Update idempotente (ver punto 2)
-      const setStatusTo = 'deposit_paid'; // o 'confirmed'
+      // 3.1) Registrar el cobro en tabla payment (ANTES de mensajes y de cerrar el log)
+      //      Usamos uq_mp (mp_payment_id único) para idempotencia.
+      const gross = amount;
+      const fee =
+        Array.isArray(pay?.fee_details) && pay.fee_details[0]?.amount != null
+          ? Number(pay.fee_details[0].amount)
+          : null;
+      const net =
+        pay?.net_received_amount != null ? Number(pay.net_received_amount) : null;
+
+      await pool.query(
+        `INSERT INTO payment
+     (appointment_id, method, amount_cents, currency,
+      gross_amount_cents, fee_cents, net_amount_cents,
+      mp_payment_id, mp_raw_json, created_at)
+   VALUES (?,?,?,?,?,?,?,?,?,NOW())
+   ON DUPLICATE KEY UPDATE
+     -- no cambiamos montos si ya existe; solo “tocamos” algo inofensivo
+     appointment_id = COALESCE(VALUES(appointment_id), appointment_id)`
+        ,
+        [
+          appointmentId,
+          'mercadopago',
+          amount != null ? Math.round(amount * 100) : null,
+          'ARS',
+          amount != null ? Math.round(amount * 100) : null,
+          fee != null ? Math.round(fee * 100) : null,
+          net != null ? Math.round(net * 100) : null,
+          String(paymentId),                        // IMPORTANTE: no null
+          JSON.stringify(pay || null)
+        ]
+      );
+
+      // 4) Update idempotente del turno
+      const setStatusTo = "deposit_paid"; // o 'confirmed' si preferís
       await pool.query(
         `UPDATE appointment
             SET status = CASE WHEN status = 'pending_deposit' THEN ? ELSE status END,
@@ -148,7 +181,9 @@ async function processPendingLogs({ onlyPaymentId = null } = {}) {
           `• Peluquero: *${ap.stylist_name}*\n` +
           `• Fecha: *${fecha} ${hora}*${montoTxt}\n\n` +
           `Te esperamos 💈`;
-        try { if (ap.phone) await sendWhatsAppText(ap.phone, msg); } catch {}
+        try {
+          if (ap.phone) await sendWhatsAppText(ap.phone, msg);
+        } catch { }
       }
 
       // 6) Log → processed
@@ -162,7 +197,6 @@ async function processPendingLogs({ onlyPaymentId = null } = {}) {
         [appointmentId, paymentId]
       );
       console.log(`[MP->PROC] Marcado processed_at OK para ${paymentId}`);
-
     } catch (err) {
       console.error(`[MP->PROC] Error con payment_id ${paymentId}:`, err.message);
       await pool.query(
@@ -177,6 +211,10 @@ async function processPendingLogs({ onlyPaymentId = null } = {}) {
 
 // Reproceso manual
 mpWebhook.post("/reprocess", async (_req, res) => {
-  try { await processPendingLogs(); res.json({ ok: true }); }
-  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  try {
+    await processPendingLogs();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });

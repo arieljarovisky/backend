@@ -14,7 +14,7 @@ import { customersAdmin } from "./routes/customersAdmin.js";
 import { admin as adminRouter } from "./routes/admin.js";
 import { mpWebhook } from "./routes/mpWebhook.js";
 import { calendar } from "./routes/calendar.js";
-
+import {payments} from "./routes/payments.js"; 
 
 dotenv.config();
 const app = express();
@@ -33,6 +33,7 @@ app.use("/api/whatsapp", whatsapp);
 app.use("/", waTest);
 app.use("/", whatsapp);
 app.use(waTemplates);
+app.use("/api/payments", payments);
 
 // ────── API Admin ──────
 app.use("/api/admin", adminDashboard);   // ← Dashboard y KPIs

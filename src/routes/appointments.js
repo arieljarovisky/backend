@@ -296,25 +296,51 @@ appointments.get("/", async (req, res) => {
   try {
     const { from, to, stylistId } = req.query;
     let sql = `
-       SELECT a.id, a.customer_id, a.stylist_id, a.service_id, a.status,
-       a.deposit_decimal,
-       DATE_FORMAT(a.deposit_paid_at, '%Y-%m-%dT%H:%i:%s') AS deposit_paid_at,
-       DATE_FORMAT(a.starts_at, '%Y-%m-%dT%H:%i:%s') AS starts_at,
-       DATE_FORMAT(a.ends_at,   '%Y-%m-%dT%H:%i:%s') AS ends_at,
-       c.name AS customer_name, c.phone_e164,
-       s.name AS service_name,
-       st.name AS stylist_name, st.color_hex
-        FROM appointment a
-        JOIN customer  c  ON c.id  = a.customer_id
-        JOIN service   s  ON s.id  = a.service_id
-        JOIN stylist   st ON st.id = a.stylist_id
-       WHERE 1=1
+      SELECT 
+        a.id, a.customer_id, a.stylist_id, a.service_id, a.status,
+        a.deposit_decimal,
+        DATE_FORMAT(a.deposit_paid_at, '%Y-%m-%dT%H:%i:%s') AS deposit_paid_at,
+        DATE_FORMAT(a.starts_at,      '%Y-%m-%dT%H:%i:%s') AS starts_at,
+        DATE_FORMAT(a.ends_at,        '%Y-%m-%dT%H:%i:%s') AS ends_at,
+        c.name AS customer_name, c.phone_e164,
+        s.name AS service_name,
+        st.name AS stylist_name, st.color_hex,
+
+        /* === NUEVO: info de pagos agregada === */
+        p.last_payment_method,
+        p.paid_cash,
+        p.paid_card,
+        p.payment_methods
+
+      FROM appointment a
+      JOIN customer  c  ON c.id  = a.customer_id
+      JOIN service   s  ON s.id  = a.service_id
+      JOIN stylist   st ON st.id = a.stylist_id
+
+      /* Subquery de agregación de pagos por turno */
+LEFT JOIN (
+  SELECT
+    appointment_id,
+    SUBSTRING_INDEX(
+      GROUP_CONCAT(method ORDER BY created_at DESC SEPARATOR ','),
+      ',', 1
+    ) AS last_payment_method,
+    (SUM(method = 'cash')  > 0) AS paid_cash,
+    (SUM(method IN ('card','debit','credit')) > 0) AS paid_card,
+    GROUP_CONCAT(DISTINCT method ORDER BY method SEPARATOR ',') AS payment_methods
+  FROM payment
+  GROUP BY appointment_id
+) p ON p.appointment_id = a.id
+
+      WHERE 1=1
     `;
-    const p = [];
-    if (from && to) { sql += " AND a.starts_at BETWEEN ? AND ?"; p.push(from, to); }
-    if (stylistId) { sql += " AND a.stylist_id = ?"; p.push(stylistId); }
+
+    const params = [];
+    if (from && to) { sql += " AND a.starts_at BETWEEN ? AND ?"; params.push(from, to); }
+    if (stylistId) { sql += " AND a.stylist_id = ?"; params.push(stylistId); }
     sql += " ORDER BY a.starts_at";
-    const [rows] = await pool.query(sql, p);
+
+    const [rows] = await pool.query(sql, params);
     res.json({ ok: true, appointments: rows });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -557,24 +583,40 @@ appointments.delete("/:id", async (req, res) => {
   }
 });
 
-/* -------- Utilidad opcional -------- */
+
+
+// Estados “futuros” válidos (excluye cancelados y completados)
+const UPCOMING_STATUSES = ["scheduled", "confirmed", "deposit_paid", "pending_deposit"];
 export async function listUpcomingAppointmentsByPhone(phone_e164, { limit = 5 } = {}) {
   if (!phone_e164) return [];
+
+  const phone = normPhone(phone_e164);              // ← conserva el '+'
+  const params = [
+    phone,
+    ...UPCOMING_STATUSES,
+    Number(limit)
+  ];
+
+  const placeholders = UPCOMING_STATUSES.map(() => "?").join(",");
+
   const [rows] = await pool.query(
-    `SELECT a.id, a.starts_at, a.ends_at, a.status,
-            s.name  AS service_name,
-            st.name AS stylist_name
-       FROM appointment a
-       JOIN customer  c  ON c.id  = a.customer_id
-       JOIN service   s  ON s.id  = a.service_id
-       JOIN stylist   st ON st.id = a.stylist_id
-      WHERE c.phone_e164 = ?
-        AND a.status = 'scheduled'
-        AND a.starts_at >= NOW()
-      ORDER BY a.starts_at ASC
-      LIMIT ?`,
-    [String(phone_e164).replace(/\D/g, ""), limit]
+    `
+    SELECT a.id, a.starts_at, a.ends_at, a.status,
+           s.name  AS service_name,
+           st.name AS stylist_name
+      FROM appointment a
+      JOIN customer  c  ON c.id  = a.customer_id
+      JOIN service   s  ON s.id  = a.service_id
+      JOIN stylist   st ON st.id = a.stylist_id
+     WHERE c.phone_e164 = ?
+       AND a.status IN (${placeholders})
+       AND a.starts_at >= NOW()
+     ORDER BY a.starts_at ASC
+     LIMIT ?
+    `,
+    params
   );
+
   return rows;
 }
 function withTimeout(promise, ms, label = "timeout") {

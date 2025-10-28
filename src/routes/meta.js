@@ -27,7 +27,7 @@ export async function listStylists() {
 }
 
 /** GET /api/services */
-meta.get("/services", async (_req, res) => {
+meta.get("/services", async (_req, res) => { 
   try {
     const data = await listServices();
     res.json({ ok: true, data });

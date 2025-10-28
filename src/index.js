@@ -17,8 +17,8 @@ import { admin as adminRouter } from "./routes/admin.js";
 import { mpWebhook } from "./routes/mpWebhook.js";
 import { calendar } from "./routes/calendar.js";
 import { payments } from "./routes/payments.js";
-import { auth } from "./routes/auth.js"; // 🆕 rutas JWT login/register/refresh
-import { requireAuth, requireRole } from "./auth/middlewares.js"; // 🧱 seguridad
+import { auth } from "./routes/auth.js";
+import { requireAuth, requireRole } from "./auth/middlewares.js";
 
 dotenv.config();
 const app = express();
@@ -32,7 +32,6 @@ const ALLOWED_ORIGINS = [
 
 app.use(cors({
     origin(origin, cb) {
-        // permitir herramientas sin Origin (curl, Postman) y los orígenes listados
         if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
         return cb(new Error(`CORS blocked: ${origin}`));
     },
@@ -45,36 +44,46 @@ app.use(cookieParser());
 
 
 // ────── API públicas ──────
-// ⚠️ NO requieren token JWT
 app.use("/api/mp-webhook", mpWebhook);
 app.use("/auth", auth);
 app.use("/api/health", health);
-app.use("/api/meta", meta);
-app.use("/api", availability);
+app.use("/api", meta);  // Sirve /services y /stylists
+app.use("/api", availability);  // Sirve /availability
 app.use("/", whatsapp);
 app.use("/api/whatsapp", whatsapp);
 
 // ────── API protegidas (JWT requerido) ──────
-// A partir de acá TODO requiere login válido
 app.use("/api/appointments", requireAuth, appointments);
 app.use("/api/calendar", requireAuth, calendar);
 app.use("/api/customers", requireAuth, requireRole("admin", "staff"), customers);
 app.use("/api/payments", requireAuth, requireRole("admin", "staff"), payments);
 
-// ────── API Admin ──────
-app.use(
-    "/api/admin",
-    requireAuth,
-    requireRole("admin", "staff"),
-    adminDashboard
-); // KPIs
+// ────── API Admin (ORDEN CORREGIDO) ──────
+// ✅ IMPORTANTE: Rutas más específicas PRIMERO, genéricas después
+
+// 1. Customers admin (ruta específica)
 app.use(
     "/api/admin/customers",
     requireAuth,
     requireRole("admin", "staff"),
     customersAdmin
 );
-app.use("/api/admin", requireAuth, requireRole("admin", "staff"), adminRouter);
+
+// 2. Métricas, charts y agenda (adminRouter tiene /metrics, /charts/*, /agenda/*)
+app.use(
+    "/api/admin",
+    requireAuth,
+    requireRole("admin", "staff"),
+    adminRouter
+);
+
+// 3. Dashboard principal (adminDashboard tiene GET /)
+app.use(
+    "/api/admin",
+    requireAuth,
+    requireRole("admin", "staff"),
+    adminDashboard
+);
 
 const port = process.env.PORT || 4000;
 app.listen(port, () =>

@@ -1,8 +1,10 @@
 // src/routes/calendar.js
 import { Router } from "express";
 import { pool } from "../db.js";
+import { requireAuth } from "../auth/middlewares.js";
 
 export const calendar = Router();
+calendar.use(requireAuth);
 
 /**
  * GET /api/calendar/events

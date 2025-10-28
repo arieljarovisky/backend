@@ -4,6 +4,7 @@ import { pool } from "../db.js";
 import { addMinutes, isAfter, isBefore } from "date-fns";
 import { validateAppointmentDate } from "../helpers/dateValidation.js";
 import { checkAppointmentOverlap, parseDateTime, toMySQLDateTime } from "../helpers/overlapValidation.js";
+import { requireAuth, requireRole } from "../auth/middlewares.js";
 
 /* ================== Helpers de fecha ================== */
 function anyToMySQL(val) {
@@ -292,7 +293,7 @@ export async function createAppointment({
 export const appointments = Router();
 
 /* -------- GET /api/appointments -------- */
-appointments.get("/", async (req, res) => {
+appointments.get("/", requireAuth, async (req, res) => {
   try {
     const { from, to, stylistId } = req.query;
     let sql = `
@@ -348,7 +349,7 @@ LEFT JOIN (
 });
 
 /* -------- POST /api/appointments -------- */
-appointments.post("/", async (req, res) => {
+appointments.post("/", requireAuth, requireRole("admin","staff"), async (req, res) =>  {
   try {
     const {
       customerName, customerPhone,
@@ -394,7 +395,7 @@ appointments.post("/", async (req, res) => {
 });
 
 /* -------- PUT /api/appointments/:id -------- */
-appointments.put("/:id", async (req, res) => {
+appointments.put("/:id", requireAuth, requireRole("admin","staff"), async (req, res) => {
   try {
     const { id } = req.params;
     const b = req.body || {};
@@ -563,7 +564,7 @@ appointments.put("/:id", async (req, res) => {
 });
 
 /* -------- DELETE /api/appointments/:id -------- */
-appointments.delete("/:id", async (req, res) => {
+appointments.delete("/:id", requireAuth, requireRole("admin","staff"), async (req, res) => {
   try {
     const { id } = req.params;
     console.log(`\n🗑️  [DELETE /appointments/${id}]`);

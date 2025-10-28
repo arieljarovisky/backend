@@ -1,9 +1,9 @@
 import { Router } from "express";
 import { pool } from "../db.js";
-
+import { requireAuth, requireRole } from "../auth/middlewares.js";
 export const payments = Router();
 
-payments.post("/", async (req, res) => {
+payments.post("/", requireAuth, requireRole("admin","staff"), async (req, res) => {
   try {
     const {
       appointmentId = null,

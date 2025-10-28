@@ -1,9 +1,9 @@
 // src/routes/customers.js
 import { Router } from "express";
 import { pool } from "../db.js";
-
+import { requireAuth, requireRole } from "../auth/middlewares.js";
 export const customers = Router();
-
+customers.use(requireAuth, requireRole("admin", "staff"));
 /** Trae un cliente por teléfono (solo dígitos) */
 export async function getCustomerByPhone(phone_e164) {
   const phone = String(phone_e164 || "").replace(/\D/g, "");

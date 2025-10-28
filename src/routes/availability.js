@@ -2,9 +2,10 @@
 import { Router } from "express";
 import { pool } from "../db.js";
 import { addMinutes, isBefore } from "date-fns";
+import { requireAuth } from "../auth/middlewares.js";
 
 export const availability = Router();
-
+availability.use(requireAuth);
 /**
  * Obtiene slots libres y ocupados para un estilista/servicio/fecha
  * @returns {{ slots: string[], busySlots: string[] }}

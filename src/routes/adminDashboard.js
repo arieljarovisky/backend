@@ -1,7 +1,10 @@
 import { Router } from "express";
 import { pool } from "../db.js";
+import { requireAuth, requireRole } from "../auth/middlewares.js";
 
 export const adminDashboard = Router();
+
+adminDashboard.use(requireAuth, requireRole("admin", "staff"));
 
 adminDashboard.get("/", async (req, res) => {
   try {

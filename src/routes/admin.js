@@ -1,8 +1,11 @@
 // src/routes/admin.js
 import { Router } from "express";
 import { pool } from "../db.js";
+import { requireAuth, requireRole } from "../auth/middlewares.js";
 
 export const admin = Router();
+admin.use(requireAuth, requireRole("admin", "staff"));
+
 
 /** Métricas rápidas para cards */
 admin.get("/metrics", async (_req, res) => {

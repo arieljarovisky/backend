@@ -1,9 +1,9 @@
 // src/routes/customersAdmin.js
 import { Router } from "express";
 import { pool } from "../db.js";
-
+import { requireAuth, requireRole } from "../auth/middlewares.js";
 export const customersAdmin = Router();
-
+customersAdmin.use(requireAuth, requireRole("admin","staff"));
 /** Listado de clientes (con búsqueda y paginación opcional) */
 customersAdmin.get("/", async (req, res) => {
   try {

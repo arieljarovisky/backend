@@ -10,5 +10,6 @@ export const pool = createPool({
   waitForConnections: true,
   decimalNumbers: true,
   connectionLimit: 10,
-  timezone: "-03:00"
+  timezone: "-03:00",
+  dateStrings: true,  // ✅ AGREGAR: Esto evita que mysql2 convierta a Date
 });

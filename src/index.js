@@ -18,6 +18,10 @@ import { mpWebhook } from "./routes/mpWebhook.js";
 import { calendar } from "./routes/calendar.js";
 import { payments } from "./routes/payments.js";
 import { auth } from "./routes/auth.js";
+import { config } from "./routes/config.js";
+import { stylistCommission } from "./routes/stylistCommission.js";
+import { stylistStats } from "./routes/stylistStats.js";
+
 import { requireAuth, requireRole } from "./auth/middlewares.js";
 
 dotenv.config();
@@ -57,6 +61,9 @@ app.use("/api/appointments", requireAuth, appointments);
 app.use("/api/calendar", requireAuth, calendar);
 app.use("/api/customers", requireAuth, requireRole("admin", "staff"), customers);
 app.use("/api/payments", requireAuth, requireRole("admin", "staff"), payments);
+app.use("/api/config", config);
+app.use("/api/commissions", stylistCommission);
+app.use("/api/stats", stylistStats);
 
 // ────── API Admin (ORDEN CORREGIDO) ──────
 // ✅ IMPORTANTE: Rutas más específicas PRIMERO, genéricas después

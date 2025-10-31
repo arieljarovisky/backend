@@ -76,10 +76,10 @@ auth.post(
         const COOKIE_SECURE = true;         // ngrok es HTTPS
         const COOKIE_SAMESITE = "none";     // cross-site requiere None
         // cookie httpOnly con el refresh JWT
-        res.cookie("rt", newRefresh, {
+        res.cookie("rt", refreshToken, {
             httpOnly: true,
-            secure: true,
-            sameSite: "none",
+            secure: COOKIE_SECURE,
+            sameSite: COOKIE_SAMESITE,
             path: "/auth",
             maxAge: expiresAt.getTime() - Date.now(),
         });

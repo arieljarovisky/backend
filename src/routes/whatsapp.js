@@ -623,15 +623,13 @@ async function _listStylists() {
 }
 
 async function _getSlots(stylistId, serviceId, date) {
-  // 1) Pedimos los "slots" base (lo que ya generás por horario laboral)
+  // 1) Slots base (según tu availability/working_hours)
   const res = await getFreeSlots({
     stylistId: Number(stylistId),
     serviceId: Number(serviceId),
     date
   });
-  let baseSlots =
-    Array.isArray(res) ? res :
-      res?.slots ?? res?.data?.slots ?? [];
+  let baseSlots = Array.isArray(res) ? res : (res?.slots ?? res?.data?.slots ?? []);
   baseSlots = baseSlots.map((s) => String(s).slice(0, 5)); // "HH:mm"
 
   // 2) Duración del servicio
@@ -640,17 +638,12 @@ async function _getSlots(stylistId, serviceId, date) {
     [Number(serviceId)]
   );
   const durMin = Number(svc?.duration_min || 0);
-  if (!durMin) {
-    // sin duración, preferimos no ofrecer nada (evita errores)
-    return [];
-  }
+  if (!durMin) return [];
 
-  // 3) Turnos ya reservados de ese día + peluquero
-  const [rows] = await pool.query(
+  // 3) Turnos ya reservados (busy por appointments)
+  const [aptRows] = await pool.query(
     `
-      SELECT
-        TIME(starts_at) AS s,
-        TIME(ends_at)   AS e
+      SELECT TIME(starts_at) AS s, TIME(ends_at) AS e
       FROM appointment
       WHERE stylist_id=?
         AND DATE(starts_at)=?
@@ -658,35 +651,52 @@ async function _getSlots(stylistId, serviceId, date) {
     `,
     [Number(stylistId), date]
   );
-  const appts = rows.map((r) => ({
-    // a "YYYY-MM-DDTHH:mm:00" para comparar fácil en Date
+  const appts = aptRows.map((r) => ({
     start: new Date(`${date}T${String(r.s).slice(0, 5)}:00`),
-    end: new Date(`${date}T${String(r.e).slice(0, 5)}:00`),
+    end:   new Date(`${date}T${String(r.e).slice(0, 5)}:00`),
   }));
 
-  // 4) Helper de solapamiento
-  const overlaps = (aStart, aEnd, bStart, bEnd) =>
-    aStart < bEnd && bStart < aEnd; // clásica regla de intervalo abierto
+  // 4) Bloqueos (busy por time_off) — contempla bloqueos que cruzan medianoche
+  const dayStart = new Date(`${date}T00:00:00`);
+  const dayEnd   = new Date(`${date}T23:59:59`);
+  const [offRows] = await pool.query(
+    `
+      SELECT starts_at AS s, ends_at AS e
+      FROM time_off
+      WHERE stylist_id=?
+        AND starts_at < DATE_ADD(?, INTERVAL 1 DAY)
+        AND ends_at   > ?
+    `,
+    [Number(stylistId), date, date]
+  );
+  const offs = offRows.map((r) => {
+    const s = new Date(r.s);
+    const e = new Date(r.e);
+    // Recortar al día consultado por si el bloqueo abarca varios días
+    const start = s < dayStart ? dayStart : s;
+    const end   = e > dayEnd   ? dayEnd   : e;
+    return { start, end };
+  });
 
-  // 5) Filtramos SOLO libres
+  // 5) Helper de solapamiento
+  const overlaps = (aStart, aEnd, bStart, bEnd) => aStart < bEnd && bStart < aEnd;
+
+  // 6) Filtrado final: quita slots que pisen turnos o bloqueos
   const free = [];
   for (const hhmm of baseSlots) {
     const start = new Date(`${date}T${hhmm}:00`);
-    const end = new Date(start.getTime() + durMin * 60000);
-    // descarto si pisa alguno ya reservado
-    const busy = appts.some(({ start: s, end: e }) => overlaps(start, end, s, e));
-    if (!busy) free.push(hhmm);
+    const end   = new Date(start.getTime() + durMin * 60000);
+
+    const busyAppt = appts.some(({ start: s, end: e }) => overlaps(start, end, s, e));
+    if (busyAppt) continue;
+
+    const busyOff = offs.some(({ start: s, end: e }) => overlaps(start, end, s, e));
+    if (busyOff) continue;
+
+    free.push(hhmm);
   }
 
   return free;
-}
-async function _book(customerPhoneE164, stylistId, serviceId, startsAtLocal) {
-  return createAppointment({
-    customerPhone: customerPhoneE164,
-    stylistId,
-    serviceId,
-    startsAt: startsAtLocal, // "YYYY-MM-DD HH:MM:SS"
-  });
 }
 
 async function _bookWithDeposit(customerPhoneE164, stylistId, serviceId, startsAtLocal, depositDecimal) {

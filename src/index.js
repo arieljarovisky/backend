@@ -23,8 +23,10 @@ import { stylistCommission } from "./routes/stylistCommission.js";
 import { stylistStats } from "./routes/stylistStats.js";
 import { notifications } from "./routes/notifications.js";
 import { workingHours } from "./routes/workingHours.js";
+import depositsAdmin from "./routes/depositsAdmin.js"; // ✅ Importar depósitos
 
 import { requireAuth, requireRole } from "./auth/middlewares.js";
+import { daysOff } from "./routes/daysOff.js";
 
 dotenv.config();
 const app = express();
@@ -68,12 +70,21 @@ app.use("/api/commissions", stylistCommission);
 app.use("/api/stats", stylistStats);
 app.use("/api", requireAuth, notifications);
 app.use("/api/working-hours", workingHours);
+app.use("/api/days-off", daysOff); 
 
 
 // ────── API Admin (ORDEN CORREGIDO) ──────
 // ✅ IMPORTANTE: Rutas más específicas PRIMERO, genéricas después
 
-// 1. Customers admin (ruta específica)
+// 1. Deposits admin (ruta específica) ✅ NUEVO
+app.use(
+    "/api/admin/deposits",
+    requireAuth,
+    requireRole("admin", "user"),
+    depositsAdmin
+);
+
+// 2. Customers admin (ruta específica)
 app.use(
     "/api/admin/customers",
     requireAuth,
@@ -81,7 +92,7 @@ app.use(
     customersAdmin
 );
 
-// 2. Métricas, charts y agenda (adminRouter tiene /metrics, /charts/*, /agenda/*)
+// 3. Métricas, charts y agenda (adminRouter tiene /metrics, /charts/*, /agenda/*)
 app.use(
     "/api/admin",
     requireAuth,
@@ -89,7 +100,7 @@ app.use(
     adminRouter
 );
 
-// 3. Dashboard principal (adminDashboard tiene GET /)
+// 4. Dashboard principal (adminDashboard tiene GET /)
 app.use(
     "/api/admin",
     requireAuth,

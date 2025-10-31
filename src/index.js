@@ -21,7 +21,8 @@ import { auth } from "./routes/auth.js";
 import { config } from "./routes/config.js";
 import { stylistCommission } from "./routes/stylistCommission.js";
 import { stylistStats } from "./routes/stylistStats.js";
-import {  notifications } from "./routes/notifications.js";
+import { notifications } from "./routes/notifications.js";
+import { workingHours } from "./routes/workingHours.js";
 
 import { requireAuth, requireRole } from "./auth/middlewares.js";
 
@@ -31,7 +32,7 @@ const app = express();
 // ────── Middlewares globales ──────
 
 const ALLOWED_ORIGINS = [
-    process.env.CORS_ORIGIN,          
+    process.env.CORS_ORIGIN,
     "http://localhost:5173",
 ].filter(Boolean);
 
@@ -60,12 +61,14 @@ app.use("/api/whatsapp", whatsapp);
 // ────── API protegidas (JWT requerido) ──────
 app.use("/api/appointments", requireAuth, appointments);
 app.use("/api/calendar", requireAuth, calendar);
-app.use("/api/customers", requireAuth, requireRole("admin", "staff"), customers);
-app.use("/api/payments", requireAuth, requireRole("admin", "staff"), payments);
+app.use("/api/customers", requireAuth, requireRole("admin", "user"), customers);
+app.use("/api/payments", requireAuth, requireRole("admin", "user"), payments);
 app.use("/api/config", config);
 app.use("/api/commissions", stylistCommission);
 app.use("/api/stats", stylistStats);
 app.use("/api", requireAuth, notifications);
+app.use("/api/working-hours", workingHours);
+
 
 // ────── API Admin (ORDEN CORREGIDO) ──────
 // ✅ IMPORTANTE: Rutas más específicas PRIMERO, genéricas después
@@ -74,7 +77,7 @@ app.use("/api", requireAuth, notifications);
 app.use(
     "/api/admin/customers",
     requireAuth,
-    requireRole("admin", "staff"),
+    requireRole("admin", "user"),
     customersAdmin
 );
 
@@ -82,7 +85,7 @@ app.use(
 app.use(
     "/api/admin",
     requireAuth,
-    requireRole("admin", "staff"),
+    requireRole("admin", "user"),
     adminRouter
 );
 
@@ -90,7 +93,7 @@ app.use(
 app.use(
     "/api/admin",
     requireAuth,
-    requireRole("admin", "staff"),
+    requireRole("admin", "user"),
     adminDashboard
 );
 

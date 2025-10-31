@@ -4,7 +4,7 @@ import { pool } from "../db.js";
 import { requireAuth, requireRole } from "../auth/middlewares.js";
 
 export const admin = Router();
-admin.use(requireAuth, requireRole("admin", "staff"));
+admin.use(requireAuth, requireRole("admin", "user"));
 
 
 /** Métricas rápidas para cards */

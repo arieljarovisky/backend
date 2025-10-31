@@ -4,7 +4,7 @@ import { requireAuth, requireRole } from "../auth/middlewares.js";
 
 export const adminDashboard = Router();
 
-adminDashboard.use(requireAuth, requireRole("admin", "staff"));
+adminDashboard.use(requireAuth, requireRole("admin", "user"));
 
 adminDashboard.get("/", async (req, res) => {
   try {

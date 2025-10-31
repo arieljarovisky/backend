@@ -14,6 +14,8 @@ import { validateAppointmentDate, isPastDateTime } from "../helpers/dateValidati
 import { addHours } from "date-fns";
 import { pool } from "../db.js";
 import { createDepositPaymentLink } from "../payments.js";
+import { cfgNumber } from "../services/config.js"; // ✅ NUEVO: lee el porcentaje desde la config
+
 
 export const whatsapp = Router();
 
@@ -323,7 +325,7 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
           return res.sendStatus(200);
         }
 
-        setStep(user, "picking_staff", { service_id, service_name, stylists, stfOffset: 0 });
+        setStep(user, "picking_user", { service_id, service_name, stylists, stfOffset: 0 });
 
         const rows = buildStylistRows(stylists, 0);
         await sendList(user, {
@@ -336,10 +338,10 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
       }
 
       // ====== PELUQUEROS: elección o "Ver más…" ======
-      if (session.step === "picking_staff" && (id.startsWith("stf_") || id === "stf_page_next")) {
+      if (session.step === "picking_user" && (id.startsWith("stf_") || id === "stf_page_next")) {
         if (id === "stf_page_next") {
           const newOffset = (session.data.stfOffset || 0) + 9;
-          setStep(user, "picking_staff", { stfOffset: newOffset });
+          setStep(user, "picking_user", { stfOffset: newOffset });
           const rows = buildStylistRows(session.data.stylists, newOffset);
           await sendList(user, {
             header: "Elegí peluquero",
@@ -414,8 +416,9 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
         if (id === "confirm_yes") {
           try {
             const fullDateTime = `${session.data.day} ${session.data.hhmm}:00`;
+            const { day } = session.data;
+            const hhmm = session.data.hhmm;
 
-            // Validaciones (ya las tenés)
             try {
               validateAppointmentDate(fullDateTime);
             } catch (validationError) {
@@ -428,41 +431,65 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
               reset(user);
               return res.sendStatus(200);
             }
-
-            // 1) Traer precio del servicio para calcular seña (50%)
+            // Re-chequeo JIT: ¿sigue libre?
+            const freshSlots = await _getSlots(session.data.stylist_id, session.data.service_id, day);
+            if (!freshSlots.includes(hhmm)) {
+              setStep(user, "picking_time", { day, slots: freshSlots, slotOffset: 0 });
+              const rows = buildSlotRows(freshSlots, day, 0);
+              await sendWhatsAppText(user, "Uff, ese horario se acaba de ocupar 😕. Elegí otro de la lista actualizada.");
+              await sendList(user, {
+                header: `Horarios ${day}`,
+                body: "Elegí un horario:",
+                buttonText: "Ver horarios",
+                rows,
+              });
+              return res.sendStatus(200);
+            }
+            // 1) Traer precio del servicio y porcentaje de seña configurado
             const [[svc]] = await pool.query(
               "SELECT name, price_decimal FROM service WHERE id=? LIMIT 1",
               [session.data.service_id]
             );
             const serviceName = svc?.name || "Servicio";
             const servicePrice = Number(svc?.price_decimal || 0);
-            const deposit = Math.max(0, Number((servicePrice / 2).toFixed(2)));
+
+            // ✅ porcentaje desde configuración (p.ej. 80)
+            const pct = await cfgNumber("deposit.percentage", 50);
+            const deposit = Math.max(0, Number((servicePrice * (pct / 100)).toFixed(2)));
+
             console.log({
               user,
               stylistId: session.data.stylist_id,
               serviceId: session.data.service_id,
               startsAt: fullDateTime,
+              pct,
               deposit
             });
-            // 2) Crear el turno con la seña en 0 o con el 50% (recomendado guardar el 50%)
+
+            // 2) Crear el turno con la seña calculada por config
             console.log("[WA] creando turno con seña...");
-            const bookResp = await _bookWithDeposit(user, session.data.stylist_id, session.data.service_id, fullDateTime, deposit);
+            const bookResp = await _bookWithDeposit(
+              user,
+              session.data.stylist_id,
+              session.data.service_id,
+              fullDateTime,
+              deposit
+            );
 
             console.log("[WA] turno creado:", bookResp);
 
-            // 3) Generar link de pago (Mercado Pago o fallback)
+            // 3) Generar link de pago con el MONTO calculado
             let payLink = "";
             try {
               payLink = await promiseWithTimeout(
                 createDepositPaymentLink({
-                  amount: deposit,
+                  amount: deposit,                         // ✅ usa el monto calculado
                   title: `Seña ${serviceName}`,
                   externalReference: String(bookResp?.id || ""),
-                  // sin success/failure: usa wa.me
                   notificationUrl: process.env.WH_URL_MP_WEBHOOK,
                   payer: { name: "", email: "", phone: user }
                 }),
-                8000 // 8 segundos máx
+                8000
               );
               console.log("[WA] link de pago listo:", payLink);
             } catch (payErr) {
@@ -471,14 +498,14 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
 
             reset(user);
 
-            // 4) Mensaje de confirmación + link
+            // 4) Mensaje de confirmación + link (sin hardcodear 50%)
             const d = new Date(fullDateTime.replace(" ", "T"));
             const fecha = d.toLocaleDateString("es-AR", { weekday: "short", day: "2-digit", month: "2-digit" });
             const hora = d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" });
             const cuerpo =
               `¡Turno reservado! ✅\n` +
               `Servicio: *${serviceName}* ($${servicePrice.toFixed(2)})\n` +
-              `Seña (50%): *$${deposit.toFixed(2)}*\n` +
+              `Seña (${pct}%): *$${deposit.toFixed(2)}*\n` +   // ✅ muestra el % real
               `Fecha: *${fecha} ${hora}*\n\n` +
               (payLink
                 ? `🔗 Pagá la seña acá:\n${payLink}\n\n` +
@@ -487,27 +514,36 @@ whatsapp.post("/webhooks/whatsapp", async (req, res) => {
 
             await sendWhatsAppText(user, cuerpo);
           } catch (e) {
-            const m = String(e?.message || "").toLowerCase();
+            const raw = String(e?.message || "");
+            const m = raw.toLowerCase();
             if (m.includes("duración del servicio")) {
               await sendWhatsAppText(user, "⚠️ Falta configurar la *duración* del servicio. Avisanos y lo corregimos enseguida.");
             } else if (m.includes("horarios definidos")) {
               await sendWhatsAppText(user, "⚠️ Ese peluquero no tiene *horarios cargados* ese día. Probá otro horario o peluquero.");
             } else if (m.includes("fuera del horario laboral")) {
               await sendWhatsAppText(user, "⚠️ Ese horario está *fuera del horario laboral*. Elegí otro.");
-            } else if (m.includes("overlap")) {
+            } else if (m.includes("overlap") || m.includes("ocupado") || m.includes("ya existe")) {
               await sendWhatsAppText(user, "Uff, ese horario se acaba de ocupar 😕 Elegí otro.");
+              const fresh = await _getSlots(session.data.stylist_id, session.data.service_id, session.data.day);
+              setStep(user, "picking_time", { day: session.data.day, slots: fresh, slotOffset: 0 });
+              const rows = buildSlotRows(fresh, session.data.day, 0);
+              await sendList(user, {
+                header: `Horarios ${session.data.day}`,
+                body: "Elegí un horario:",
+                buttonText: "Ver horarios",
+                rows,
+              });
             } else if (m.includes("pasado")) {
               await sendWhatsAppText(user, "⚠️ No podés agendar turnos en el pasado.\n\nEscribí *hola* para empezar de nuevo.");
             } else {
-              await sendWhatsAppText(user, "No pude guardar el turno.\n\nProbá de nuevo escribiendo *hola*.");
+              console.error("[WA] Error inesperado al guardar el turno:", raw);
+              await sendWhatsAppText(user, "No pude guardar el turno por un error inesperado. Probá de nuevo o elegí otro horario.");
             }
             reset(user);
           }
           return res.sendStatus(200);
         }
       }
-
-      return res.sendStatus(200);
     }
 
     // Otros tipos de mensaje
@@ -587,23 +623,63 @@ async function _listStylists() {
 }
 
 async function _getSlots(stylistId, serviceId, date) {
-  // fuerza números por las dudas
+  // 1) Pedimos los "slots" base (lo que ya generás por horario laboral)
   const res = await getFreeSlots({
     stylistId: Number(stylistId),
     serviceId: Number(serviceId),
     date
   });
+  let baseSlots =
+    Array.isArray(res) ? res :
+      res?.slots ?? res?.data?.slots ?? [];
+  baseSlots = baseSlots.map((s) => String(s).slice(0, 5)); // "HH:mm"
 
-  // normalizamos todas las formas posibles de respuesta
-  if (Array.isArray(res)) return res;
-  if (Array.isArray(res?.slots)) return res.slots;
-  if (Array.isArray(res?.data?.slots)) return res.data.slots;
+  // 2) Duración del servicio
+  const [[svc]] = await pool.query(
+    "SELECT duration_min FROM service WHERE id=? LIMIT 1",
+    [Number(serviceId)]
+  );
+  const durMin = Number(svc?.duration_min || 0);
+  if (!durMin) {
+    // sin duración, preferimos no ofrecer nada (evita errores)
+    return [];
+  }
 
-  // debug opcional
-  console.log("[BOT] getFreeSlots() respuesta inesperada:", res);
-  return [];
+  // 3) Turnos ya reservados de ese día + peluquero
+  const [rows] = await pool.query(
+    `
+      SELECT
+        TIME(starts_at) AS s,
+        TIME(ends_at)   AS e
+      FROM appointment
+      WHERE stylist_id=?
+        AND DATE(starts_at)=?
+        AND status IN ('scheduled','confirmed','deposit_paid','pending_deposit')
+    `,
+    [Number(stylistId), date]
+  );
+  const appts = rows.map((r) => ({
+    // a "YYYY-MM-DDTHH:mm:00" para comparar fácil en Date
+    start: new Date(`${date}T${String(r.s).slice(0, 5)}:00`),
+    end: new Date(`${date}T${String(r.e).slice(0, 5)}:00`),
+  }));
+
+  // 4) Helper de solapamiento
+  const overlaps = (aStart, aEnd, bStart, bEnd) =>
+    aStart < bEnd && bStart < aEnd; // clásica regla de intervalo abierto
+
+  // 5) Filtramos SOLO libres
+  const free = [];
+  for (const hhmm of baseSlots) {
+    const start = new Date(`${date}T${hhmm}:00`);
+    const end = new Date(start.getTime() + durMin * 60000);
+    // descarto si pisa alguno ya reservado
+    const busy = appts.some(({ start: s, end: e }) => overlaps(start, end, s, e));
+    if (!busy) free.push(hhmm);
+  }
+
+  return free;
 }
-
 async function _book(customerPhoneE164, stylistId, serviceId, startsAtLocal) {
   return createAppointment({
     customerPhone: customerPhoneE164,

@@ -128,7 +128,7 @@ export async function createNotification({ userId, type, title, message, data = 
 export async function notifyAdmins({ type, title, message, data = null }) {
   try {
     const [admins] = await pool.query(
-      'SELECT id FROM users WHERE role IN ("admin", "staff")'
+      'SELECT id FROM users WHERE role IN ("admin", "user")'
     );
     for (const admin of admins) {
       await createNotification({ userId: admin.id, type, title, message, data });

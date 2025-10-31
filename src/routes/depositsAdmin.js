@@ -4,7 +4,7 @@ import { pool } from "../db.js";
 import { requireAuth, requireRole } from "../auth/middlewares.js";
 
 export const depositsAdmin = Router();
-depositsAdmin.use(requireAuth, requireRole("admin", "staff"));
+depositsAdmin.use(requireAuth, requireRole("admin", "user"));
 
 // ============================================
 // DASHBOARD - Métricas principales

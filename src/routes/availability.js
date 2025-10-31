@@ -6,6 +6,7 @@ import { requireAuth } from "../auth/middlewares.js";
 
 export const availability = Router();
 availability.use(requireAuth);
+
 /**
  * Obtiene slots libres y ocupados para un estilista/servicio/fecha
  * @returns {{ slots: string[], busySlots: string[] }}
@@ -24,39 +25,59 @@ export async function getFreeSlots({ stylistId, serviceId, date, stepMin }) {
     console.log("❌ Servicio no encontrado o inactivo");
     return { slots: [], busySlots: [] };
   }
-
   const blockMin = Number(stepMin || svc.duration_min || 30);
   console.log(`⏱️  Duración del servicio: ${svc.duration_min}min, Step: ${blockMin}min`);
 
-  // 2) Working hours
-  const weekday = new Date(`${date}T00:00:00`).getDay();
-  const [whRows] = await pool.query(
-    `SELECT start_time, end_time
-       FROM working_hours
-      WHERE stylist_id=? AND weekday=?`,
-    [stylistId, weekday]
-  );
+  // --- 2) Working hours (soporta weekday 0-6 y 1-7) ---
+  const jsWeekday = new Date(`${date}T00:00:00`).getDay(); // 0..6 (0=Dom)
+  const altWeekday = jsWeekday === 0 ? 7 : jsWeekday;      // 1..7
 
+  const [whRows] = await pool.query(
+    `SELECT weekday, start_time, end_time
+     FROM working_hours
+    WHERE stylist_id = ?
+      AND weekday IN (?, ?)
+    ORDER BY start_time`,
+    [stylistId, jsWeekday, altWeekday]
+  );
   if (!whRows.length) {
-    console.log(`❌ Sin horarios de trabajo para día ${weekday}`);
+    console.log(`❌ Sin horarios para wd=${jsWeekday} (alt=${altWeekday})`);
     return { slots: [], busySlots: [] };
   }
 
-  const { start_time, end_time } = whRows[0];
-  console.log(`🕐 Horario laboral: ${start_time} - ${end_time}`);
+  if (!whRows.length) {
+    // Log de ayuda para detectar cómo está cargada la tabla
+    const [dbg] = await pool.query(
+      `SELECT DISTINCT weekday, start_time, end_time
+       FROM working_hours
+      WHERE stylist_id = ?
+      ORDER BY weekday, start_time`,
+      [stylistId]
+    );
+    console.log(`❌ Sin horarios para el día ${jsWeekday} (alt ${altWeekday}). Horarios existentes para el estilista:`, dbg);
+    return { slots: [], busySlots: [] };
+  }
 
-  const open = new Date(`${date}T${start_time}`);
-  const close = new Date(`${date}T${end_time}`);
+  console.log(
+    `🕐 Horarios laborales (${whRows.length} intervalo/s):`,
+    whRows.map(r => `${r.start_time}-${r.end_time} (wd=${r.weekday})`).join(" | ")
+  );
 
-  // 4) traer turnos del día (scheduled) y ausencias que solapen
+  const OCCUPYING = ["scheduled", "pending_deposit", "deposit_paid", "confirmed"];
+  const placeholders = OCCUPYING.map(() => "?").join(",");
+
+  // para cubrir todo el día (no solo la ventana exacta de working hours)
+  const dayOpen = new Date(`${date}T00:00:00`);
+  const dayClose = new Date(`${date}T23:59:59`);
+
   const [appts] = await pool.query(
-    `SELECT starts_at, ends_at
+    `SELECT id, starts_at, ends_at, status
      FROM appointment
     WHERE stylist_id = ?
-      AND status = 'scheduled'
       AND starts_at < ?
-      AND ends_at   > ?`,
-    [stylistId, close, open]
+      AND ends_at   > ?
+      AND status IN (${placeholders})`,
+    [stylistId, dayClose, dayOpen, ...OCCUPYING]
   );
 
   const [offs] = await pool.query(
@@ -65,83 +86,63 @@ export async function getFreeSlots({ stylistId, serviceId, date, stepMin }) {
     WHERE stylist_id = ?
       AND starts_at < ?
       AND ends_at   > ?`,
-    [stylistId, close, open]
+    [stylistId, dayClose, dayOpen]
   );
 
   console.log(`📅 Turnos existentes: ${appts.length}, Ausencias: ${offs.length}`);
 
-  // Crear array de intervalos ocupados
+  const BUFFER_MIN = Number(process.env.APPT_BUFFER_MIN || 0);
   const busy = [
-    ...appts.map((a) => ({
-      start: new Date(a.starts_at),
-      end: new Date(a.ends_at),
-      type: 'appointment',
-      id: a.id
+    ...appts.map(a => ({
+      start: addMinutes(new Date(a.starts_at), -BUFFER_MIN),
+      end: addMinutes(new Date(a.ends_at), +BUFFER_MIN),
     })),
-    ...offs.map((o) => ({
+    ...offs.map(o => ({
       start: new Date(o.starts_at),
       end: new Date(o.ends_at),
-      type: 'time_off'
     })),
   ];
 
-  console.log(`🔴 Total intervalos ocupados: ${busy.length}`);
-  busy.forEach(b => {
-    const s = b.start.toTimeString().slice(0, 5);
-    const e = b.end.toTimeString().slice(0, 5);
-    console.log(`   ${s} - ${e} (${b.type})`);
-  });
-
-  // 4) Generar todos los slots posibles
-  const allSlots = [];
-  const busySlots = [];
+  // --- 4) Generar slots sobre CADA intervalo laboral ---
+  const allSlots = new Set();
+  const busySlots = new Set();
   const now = new Date();
 
-  for (
-    let t = new Date(open);
-    isBefore(addMinutes(t, blockMin), addMinutes(close, 1));
-    t = addMinutes(t, blockMin)
-  ) {
-    const start = new Date(t);
-    const end = addMinutes(start, blockMin);
+  for (const wh of whRows) {
+    const open = new Date(`${date}T${wh.start_time}`);
+    const close = new Date(`${date}T${wh.end_time}`);
 
-    // ❌ Filtrar slots pasados
-    if (start <= now) continue;
+    for (let t = new Date(open);
+      isBefore(addMinutes(t, blockMin), addMinutes(close, 1));
+      t = addMinutes(t, blockMin)) {
 
-    const hh = String(start.getHours()).padStart(2, "0");
-    const mm = String(start.getMinutes()).padStart(2, "0");
-    const timeSlot = `${hh}:${mm}`;
+      const start = new Date(t);
+      const end = addMinutes(start, blockMin);
 
-    // ⚡ Verificar solapamiento con CUALQUIER turno/ausencia
-    const overlap = busy.some(({ start: b0, end: b1 }) => {
-      // Un slot se solapa si:
-      // - Empieza antes de que termine el turno ocupado
-      // - Termina después de que empiece el turno ocupado
-      return start < b1 && end > b0;
-    });
+      if (start <= now) continue; // no mostrar pasados
 
-    allSlots.push(timeSlot);
+      const hh = String(start.getHours()).padStart(2, "0");
+      const mm = String(start.getMinutes()).padStart(2, "0");
+      const timeSlot = `${hh}:${mm}`;
 
-    if (overlap) {
-      busySlots.push(timeSlot);
+      const solapa = busy.some(({ start: b0, end: b1 }) => start < b1 && end > b0);
+
+      allSlots.add(timeSlot);
+      if (solapa) busySlots.add(timeSlot);
     }
   }
 
-  console.log(`\n📊 Resultado:`);
-  console.log(`   Total slots: ${allSlots.length}`);
-  console.log(`   Ocupados: ${busySlots.length}`);
-  console.log(`   Libres: ${allSlots.length - busySlots.length}`);
-  console.log(`   Slots libres:`, allSlots.filter(s => !busySlots.includes(s)));
+  const slotsArr = Array.from(allSlots).sort();
+  const busyArr = Array.from(busySlots).sort();
 
-  return {
-    slots: allSlots,
-    busySlots: busySlots,
-  };
+  console.log(`\n📊 Resultado: Total ${slotsArr.length}, Ocupados ${busyArr.length}, Libres ${slotsArr.length - busyArr.length}`);
+  console.log(`   Slots libres:`, slotsArr.filter(s => !busyArr.includes(s)));
+
+  return { slots: slotsArr, busySlots: busyArr };
+
 }
 
-/**
- * Endpoint GET /api/availability
- */
+// GET /api/availability
 availability.get("/availability", async (req, res) => {
   try {
     const stylistId = Number(req.query.stylistId);
@@ -150,10 +151,7 @@ availability.get("/availability", async (req, res) => {
     const stepMin = req.query.stepMin ? Number(req.query.stepMin) : undefined;
 
     if (!stylistId || !serviceId || !date) {
-      return res.status(400).json({
-        ok: false,
-        error: "Parámetros requeridos: stylistId, serviceId, date",
-      });
+      return res.status(400).json({ ok: false, error: "Parámetros requeridos: stylistId, serviceId, date" });
     }
 
     const result = await getFreeSlots({ stylistId, serviceId, date, stepMin });
@@ -161,15 +159,9 @@ availability.get("/availability", async (req, res) => {
     console.log("\n✅ [API RESPONSE]");
     console.log(`   Enviando ${result.slots.length} slots, ${result.busySlots.length} ocupados`);
 
-    return res.json({
-      ok: true,
-      data: {
-        slots: result.slots,
-        busySlots: result.busySlots,
-      },
-    });
+    res.json({ ok: true, data: { slots: result.slots, busySlots: result.busySlots } });
   } catch (e) {
     console.error("\n❌ [GET /api/availability] error:", e);
-    return res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: e.message });
   }
 });

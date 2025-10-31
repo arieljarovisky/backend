@@ -47,6 +47,7 @@ app.use(cors({
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
 }));
+app.set("trust proxy", 1); // necesario en Render para que secure funcione
 app.use(express.json());
 app.use(cookieParser());
 

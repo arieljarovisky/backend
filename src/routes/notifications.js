@@ -2,9 +2,31 @@
 import { Router } from "express";
 import { pool } from "../db.js";
 import { requireRole } from "../auth/middlewares.js";
+import crypto from "crypto";
 
 export const notifications = Router();
 
+function stableStringify(obj) {
+  return JSON.stringify(obj, Object.keys(obj).sort());
+}
+
+function computeIdemKey(userId, type, title, message, data) {
+  const apptId = data && data.appointmentId != null
+    ? String(data.appointmentId)
+    : null;
+
+  if (apptId) {
+    // 🔒 Dedup por usuario + turno (sin importar el type)
+    return `u${userId}|appt|${apptId}`;
+  }
+
+  // Otros tipos: hash estable del contenido
+  const payload = JSON.stringify({ type, title, message, data: data || {} });
+  const digest = crypto.createHash("sha1")
+    .update(String(userId) + "|" + payload)
+    .digest("hex");
+  return "h|" + digest;
+}
 /** LISTAR (usa auth del router montado en index.js) */
 notifications.get("/notifications", async (req, res) => {
   try {
@@ -111,15 +133,29 @@ notifications.post("/notifications", async (req, res) => {
 
 function safeParseJSON(s) { try { return JSON.parse(s); } catch { return null; } }
 
-// Helper (lo dejás igual)
-export async function createNotification({ userId, type, title, message, data = null }) {
-  try {
-    await pool.query(
-      `INSERT INTO notifications (user_id, type, title, message, data, is_read)
-       VALUES (?, ?, ?, ?, ?, 0)`,
-      [userId, type, title, message, data ? JSON.stringify(data) : null]
-    );
-  } catch (error) {
-    console.error("❌ [createNotification] Error:", error);
-  }
+
+
+
+
+
+export async function createNotification({ userId, type, title, message, data }) {
+  // Clave idem: por turno si hay appointmentId; si no, hash del contenido
+  const idemKey = (() => {
+    const apptId = data?.appointmentId ?? null;
+    if (apptId) return `u${userId}|appt|${apptId}|${type}`;
+    const payload = JSON.stringify({ type, title, message, data: data ?? {} });
+    const digest = crypto.createHash("sha1").update(`${userId}|${payload}`).digest("hex");
+    return `h|${digest}`;
+  })();
+
+  await pool.query(
+    `
+    INSERT INTO notifications (user_id, type, title, message, data, idempotency_key)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+      title = VALUES(title),
+      message = VALUES(message)
+    `,
+    [userId, type, title, message, JSON.stringify(data || {}), idemKey]
+  );
 }

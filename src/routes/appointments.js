@@ -342,34 +342,56 @@ appointments.get("/", requireAuth, async (req, res) => {
 
 /* -------- POST /api/appointments -------- */
 appointments.post("/", requireAuth, requireRole("admin", "user"), async (req, res) => {
+  const { stylistId, serviceId, customerId, startsAt, endsAt } = req.body;
+
+  // 1) Datos legibles (opcionales pero recomendados)
+  let customerLabel = `Cliente #${customerId}`;
+  let serviceLabel = `Servicio #${serviceId}`;
   try {
-    await createNotification({
-      userId: req.user.id,
-      type: "appointment",
-      title: "Nuevo turno reservado",
-      message: `Cliente: ${customerName || customerPhone} — Servicio #${serviceId} — Inicio: ${startsAt}`,
-      data: { appointmentId: result.id, stylistId, serviceId, startsAt }
-    });
-    console.log("🔔 [appointments] Notificación creada para user:", req.user.id, "appt:", result.id);
+    const [[c]] = await pool.query(
+      "SELECT COALESCE(name, '') AS name, COALESCE(phone_e164, '') AS phone FROM customer WHERE id=?",
+      [customerId]
+    );
+    if (c?.name || c?.phone) {
+      customerLabel = c.name ? c.name : c.phone || customerLabel;
+    }
+    const [[s]] = await pool.query(
+      "SELECT COALESCE(name,'') AS name, duration_min FROM service WHERE id=?",
+      [serviceId]
+    );
+    if (s?.name) serviceLabel = s.name;
   } catch (e) {
-    console.error("⚠️ [appointments] No se pudo crear notificación (admin):", e.message);
+    console.warn("ℹ️ [appointments] No pude enriquecer labels cliente/servicio:", e.message);
   }
 
-  // (Opcional) Notificar al estilista si tiene user asignado
+  // 2) Notificación para el usuario autenticado (tu campanita)
   try {
-    const [[styUser]] = await pool.query(
-      "SELECT user_id FROM stylist WHERE id=? LIMIT 1",
-      [stylistId]
-    );
-    if (styUser?.user_id) {
+    await createNotification({
+      userId: req.user.id, // <- esto garantiza que /notifications/count te sume
+      type: "appointment",
+      title: "Nuevo turno reservado",
+      message: `${customerLabel} — ${serviceLabel} — Inicio: ${startsAt}`,
+      data: { appointmentId: result.id, stylistId, serviceId, customerId, startsAt, endsAt }
+    });
+    console.log("🔔 [appointments] Notificación (admin/user) creada:", { userId: req.user.id, apptId: result.id });
+  } catch (e) {
+    console.error("⚠️ [appointments] No se pudo crear notificación (admin/user):", e.message);
+  }
+
+  // 3) (Opcional) Notificar al estilista si tiene usuario vinculado
+  try {
+    const [[sty]] = await pool.query("SELECT user_id FROM stylist WHERE id=? LIMIT 1", [stylistId]);
+    if (sty?.user_id) {
       await createNotification({
-        userId: styUser.user_id,
+        userId: sty.user_id,
         type: "appointment",
         title: "Te asignaron un nuevo turno",
-        message: `Cliente: ${customerName || customerPhone} — Servicio #${serviceId} — Inicio: ${startsAt}`,
-        data: { appointmentId: result.id, stylistId, serviceId, startsAt }
+        message: `${customerLabel} — ${serviceLabel} — Inicio: ${startsAt}`,
+        data: { appointmentId: result.id, stylistId, serviceId, customerId, startsAt, endsAt }
       });
-      console.log("🔔 [appointments] Notificación creada para estilista.user_id:", styUser.user_id);
+      console.log("🔔 [appointments] Notificación (estilista) creada:", { userId: sty.user_id, apptId: result.id });
+    } else {
+      console.log("ℹ️ [appointments] Estilista sin user_id, no se notifica al estilista.");
     }
   } catch (e) {
     console.error("⚠️ [appointments] No se pudo notificar estilista:", e.message);

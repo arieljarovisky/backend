@@ -50,6 +50,8 @@ function anyToMySQL(val) {
   return null;
 }
 
+
+
 function fmtLocal(iso) {
   const d = new Date(iso);
   const f = d.toLocaleDateString("es-AR", { weekday: "short", day: "2-digit", month: "2-digit" });
@@ -285,112 +287,117 @@ export async function createAppointment({
 /* ========= Router ========= */
 export const appointments = Router();
 
-/* -------- GET /api/appointments -------- */
-appointments.get("/", requireAuth, async (req, res) => {
+appointments.post("/", requireRole("admin", "user"), async (req, res) => {
   try {
-    const { from, to, stylistId } = req.query;
-    let sql = `
-      SELECT 
-        a.id, a.customer_id, a.stylist_id, a.service_id, a.status,
-        a.deposit_decimal,
-        DATE_FORMAT(a.deposit_paid_at, '%Y-%m-%dT%H:%i:%s') AS deposit_paid_at,
-        DATE_FORMAT(a.starts_at,      '%Y-%m-%dT%H:%i:%s') AS starts_at,
-        DATE_FORMAT(a.ends_at,        '%Y-%m-%dT%H:%i:%s') AS ends_at,
-        c.name AS customer_name, c.phone_e164,
-        s.name AS service_name,
-        st.name AS stylist_name, st.color_hex,
+    const {
+      stylistId,
+      serviceId,
+      customerId,         // puede venir o no
+      customerName,       // para autogenerar
+      customerPhone,      // para autogenerar
+      customerNotes,      // opcional
+      startsAt,
+      endsAt              // puede venir null, según tu flujo
+    } = req.body;
 
-        /* Info de pagos agregada */
-        p.last_payment_method,
-        p.paid_cash,
-        p.paid_card,
-        p.payment_methods
+    // --- 1) Asegurar cliente ---
+    let effectiveCustomerId = customerId || null;
 
-      FROM appointment a
-      JOIN customer  c  ON c.id  = a.customer_id
-      JOIN service   s  ON s.id  = a.service_id
-      JOIN stylist   st ON st.id = a.stylist_id
+    if (!effectiveCustomerId) {
+      effectiveCustomerId = await ensureCustomerId(
+        { name: customerName, phone: customerPhone, notes: customerNotes },
+        pool
+      );
+    }
 
-      /* Subquery de agregación de pagos por turno */
-      LEFT JOIN (
-        SELECT
-          appointment_id,
-          SUBSTRING_INDEX(
-            GROUP_CONCAT(method ORDER BY created_at DESC SEPARATOR ','),
-            ',', 1
-          ) AS last_payment_method,
-          (SUM(method = 'cash')  > 0) AS paid_cash,
-          (SUM(method IN ('card','debit','credit')) > 0) AS paid_card,
-          GROUP_CONCAT(DISTINCT method ORDER BY method SEPARATOR ',') AS payment_methods
-        FROM payment
-        GROUP BY appointment_id
-      ) p ON p.appointment_id = a.id
-      WHERE 1=1
-    `;
+    if (!effectiveCustomerId) {
+      return res.status(400).json({
+        ok: false,
+        error: "No se pudo determinar/crear el cliente (faltan datos)"
+      });
+    }
 
-    const params = [];
-    if (from && to) { sql += " AND a.starts_at BETWEEN ? AND ?"; params.push(from, to); }
-    if (stylistId) { sql += " AND a.stylist_id = ?"; params.push(stylistId); }
-    sql += " ORDER BY a.starts_at";
-
-    const [rows] = await pool.query(sql, params);
-    res.json({ ok: true, appointments: rows });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/* -------- POST /api/appointments -------- */
-appointments.post("/", requireAuth, requireRole("admin", "user"), async (req, res) => {
-  const { stylistId, serviceId, customerId, startsAt, endsAt } = req.body;
-
-  // Acá va **tu** inserción real del turno:
-  const insertResult = await pool.query(
-    `INSERT INTO appointment (stylist_id, service_id, customer_id, starts_at, ends_at, status)
-   VALUES (?, ?, ?, ?, ?, 'scheduled')`,
-    [stylistId, serviceId, customerId, startsAt, endsAt]
-  );
-
-  // Normalmente mysql2 devuelve [result] y result.insertId
-  const inserted = Array.isArray(insertResult) ? insertResult[0] : insertResult;
-  const appointmentId =
-    inserted?.insertId ??
-    inserted?.id ??              // por si tu helper devolviera { id: ... }
-    null;
-
-  console.log("🧾 [appointments] creado apptId:", appointmentId, "stylistId:", stylistId);
-
-  // Labels legibles (opcionales)
-  let customerLabel = `Cliente #${customerId}`;
-  let serviceLabel = `Servicio #${serviceId}`;
-  try {
-    const [[c]] = await pool.query(
-      "SELECT COALESCE(name,'') AS name, COALESCE(phone_e164,'') AS phone FROM customer WHERE id=?",
-      [customerId]
+    // --- 2) Insertar turno ---
+    const [ins] = await pool.query(
+      `INSERT INTO appointment (stylist_id, service_id, customer_id, starts_at, ends_at, status, created_at)
+       VALUES (?, ?, ?, ?, ?, 'scheduled', NOW())`,
+      [stylistId, serviceId, effectiveCustomerId, startsAt, endsAt || null]
     );
-    if (c?.name || c?.phone) customerLabel = c.name || c.phone || customerLabel;
 
-    const [[s]] = await pool.query(
-      "SELECT COALESCE(name,'') AS name FROM service WHERE id=?",
-      [serviceId]
-    );
-    if (s?.name) serviceLabel = s.name;
-  } catch (e) {
-    console.warn("ℹ️ [appointments] No pude enriquecer labels:", e.message);
-  }
+    const appointmentId = ins.insertId;
+    console.log("🧾 [appointments] creado apptId:", appointmentId, "stylistId:", stylistId, "customerId:", effectiveCustomerId);
 
-  // Notificación para el usuario autenticado (tu campanita)
-  try {
-    await createNotification({
-      userId: req.user.id,  // ✅ asegura que CUENTE para tu token
-      type: "appointment",
-      title: "Nuevo turno reservado",
-      message: `${customerLabel} — ${serviceLabel} — Inicio: ${startsAt}`,
-      data: { appointmentId, stylistId, serviceId, customerId, startsAt, endsAt }
-    });
-    console.log("🔔 [appointments] Notificación (admin/user) creada:", { userId: req.user.id, appointmentId });
-  } catch (e) {
-    console.error("⚠️ [appointments] No se pudo crear notificación (admin/user):", e.message);
+    // --- 3) Etiquetas legibles (opcional) ---
+    let customerLabel = `Cliente #${effectiveCustomerId}`;
+    let serviceLabel = `Servicio #${serviceId}`;
+    try {
+      const [[c]] = await pool.query(
+        "SELECT COALESCE(name,'') AS name, COALESCE(phone_e164,'') AS phone FROM customer WHERE id=?",
+        [effectiveCustomerId]
+      );
+      if (c?.name || c?.phone) customerLabel = c.name || c.phone || customerLabel;
+
+      const [[s]] = await pool.query(
+        "SELECT COALESCE(name,'') AS name FROM service WHERE id=?",
+        [serviceId]
+      );
+      if (s?.name) serviceLabel = s.name;
+    } catch (e) {
+      console.warn("ℹ️ [appointments] No pude enriquecer labels:", e.message);
+    }
+
+    // --- 4) Notificación para el usuario autenticado (campanita) ---
+    try {
+      await createNotification({
+        userId: req.user.id,
+        type: "appointment",
+        title: "Nuevo turno reservado",
+        message: `${customerLabel} — ${serviceLabel} — Inicio: ${startsAt}`,
+        data: { appointmentId, stylistId, serviceId, customerId: effectiveCustomerId, startsAt, endsAt }
+      });
+      console.log("🔔 [appointments] Notificación (admin/user) creada:", { userId: req.user.id, appointmentId });
+    } catch (e) {
+      console.error("⚠️ [appointments] No se pudo crear notificación (admin/user):", e.message);
+    }
+
+    // --- 5) (Opcional) Notificar al estilista si existe la columna user_id ---
+    try {
+      const [cols] = await pool.query(`
+        SELECT 1
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'stylist'
+          AND COLUMN_NAME = 'user_id'
+        LIMIT 1
+      `);
+
+      if (cols.length) {
+        const [[sty]] = await pool.query("SELECT user_id FROM stylist WHERE id=? LIMIT 1", [stylistId]);
+        if (sty?.user_id) {
+          await createNotification({
+            userId: sty.user_id,
+            type: "appointment",
+            title: "Te asignaron un nuevo turno",
+            message: `${customerLabel} — ${serviceLabel} — Inicio: ${startsAt}`,
+            data: { appointmentId, stylistId, serviceId, customerId: effectiveCustomerId, startsAt, endsAt }
+          });
+          console.log("🔔 [appointments] Notificación (estilista) creada:", { userId: sty.user_id, appointmentId });
+        } else {
+          console.log("ℹ️ [appointments] Estilista sin user_id — no se notifica.");
+        }
+      } else {
+        console.log("ℹ️ [appointments] 'stylist.user_id' no existe en este entorno — salto notificación a estilista.");
+      }
+    } catch (e) {
+      console.error("⚠️ [appointments] No se pudo notificar estilista:", e.message);
+    }
+
+    // --- 6) Responder ---
+    return res.status(201).json({ ok: true, id: appointmentId });
+
+  } catch (err) {
+    console.error("❌ [appointments POST] ERROR:", err);
+    return res.status(500).json({ ok: false, error: "No se pudo crear el turno" });
   }
 });
 

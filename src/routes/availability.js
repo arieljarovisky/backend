@@ -1,4 +1,4 @@
-// src/routes/availability.js
+// src/routes/availability.js — MULTI-TENANT
 import { Router } from "express";
 import { pool } from "../db.js";
 import { addMinutes, isBefore } from "date-fns";
@@ -8,88 +8,66 @@ export const availability = Router();
 availability.use(requireAuth);
 
 /**
- * Obtiene slots libres y ocupados para un estilista/servicio/fecha
+ * Core: obtiene slots libres/ocupados (requiere tenantId)
  * @returns {{ slots: string[], busySlots: string[] }}
  */
-export async function getFreeSlots({ stylistId, serviceId, date, stepMin }) {
-  if (!stylistId || !serviceId || !date) return { slots: [], busySlots: [] };
+export async function getFreeSlots({ tenantId, stylistId, serviceId, date, stepMin }) {
+  if (!tenantId || !stylistId || !serviceId || !date) return { slots: [], busySlots: [] };
 
-  console.log(`\n🔍 [AVAILABILITY] Consultando: stylist=${stylistId}, service=${serviceId}, date=${date}`);
-
-  // 1) Duración del servicio
+  // 1) Duración del servicio (scoped)
   const [[svc]] = await pool.query(
-    `SELECT duration_min FROM service WHERE id=? AND is_active=1`,
-    [serviceId]
+    `SELECT duration_min 
+       FROM service 
+      WHERE id=? AND tenant_id=? AND is_active=1`,
+    [serviceId, tenantId]
   );
-  if (!svc) {
-    console.log("❌ Servicio no encontrado o inactivo");
-    return { slots: [], busySlots: [] };
-  }
-  const blockMin = Number(stepMin || svc.duration_min || 30);
-  console.log(`⏱️  Duración del servicio: ${svc.duration_min}min, Step: ${blockMin}min`);
+  if (!svc) return { slots: [], busySlots: [] };
 
-  // --- 2) Working hours (soporta weekday 0-6 y 1-7) ---
-  const jsWeekday = new Date(`${date}T00:00:00`).getDay(); // 0..6 (0=Dom)
-  const altWeekday = jsWeekday === 0 ? 7 : jsWeekday;      // 1..7
+  const blockMin = Number(stepMin || svc.duration_min || 30);
+
+  // --- 2) Working hours (weekday 0..6 y 1..7) ---
+  const jsWeekday = new Date(`${date}T00:00:00`).getDay(); // 0=Dom
+  const altWeekday = jsWeekday === 0 ? 7 : jsWeekday;
 
   const [whRows] = await pool.query(
     `SELECT weekday, start_time, end_time
-     FROM working_hours
-    WHERE stylist_id = ?
-      AND weekday IN (?, ?)
-    ORDER BY start_time`,
-    [stylistId, jsWeekday, altWeekday]
-  );
-  if (!whRows.length) {
-    console.log(`❌ Sin horarios para wd=${jsWeekday} (alt=${altWeekday})`);
-    return { slots: [], busySlots: [] };
-  }
-
-  if (!whRows.length) {
-    // Log de ayuda para detectar cómo está cargada la tabla
-    const [dbg] = await pool.query(
-      `SELECT DISTINCT weekday, start_time, end_time
        FROM working_hours
-      WHERE stylist_id = ?
-      ORDER BY weekday, start_time`,
-      [stylistId]
-    );
-    console.log(`❌ Sin horarios para el día ${jsWeekday} (alt ${altWeekday}). Horarios existentes para el estilista:`, dbg);
-    return { slots: [], busySlots: [] };
-  }
-
-  console.log(
-    `🕐 Horarios laborales (${whRows.length} intervalo/s):`,
-    whRows.map(r => `${r.start_time}-${r.end_time} (wd=${r.weekday})`).join(" | ")
+      WHERE tenant_id=? 
+        AND stylist_id=? 
+        AND weekday IN (?, ?)
+      ORDER BY start_time`,
+    [tenantId, stylistId, jsWeekday, altWeekday]
   );
+  if (!whRows.length) return { slots: [], busySlots: [] };
 
   const OCCUPYING = ["scheduled", "pending_deposit", "deposit_paid", "confirmed"];
   const placeholders = OCCUPYING.map(() => "?").join(",");
 
-  // para cubrir todo el día (no solo la ventana exacta de working hours)
   const dayOpen = new Date(`${date}T00:00:00`);
   const dayClose = new Date(`${date}T23:59:59`);
 
+  // 3) Turnos existentes (scoped)
   const [appts] = await pool.query(
     `SELECT id, starts_at, ends_at, status
-     FROM appointment
-    WHERE stylist_id = ?
-      AND starts_at < ?
-      AND ends_at   > ?
-      AND status IN (${placeholders})`,
-    [stylistId, dayClose, dayOpen, ...OCCUPYING]
+       FROM appointment
+      WHERE tenant_id=? 
+        AND stylist_id=? 
+        AND starts_at < ? 
+        AND ends_at   > ? 
+        AND status IN (${placeholders})`,
+    [tenantId, stylistId, dayClose, dayOpen, ...OCCUPYING]
   );
 
+  // 4) Bloqueos del estilista (scoped)
   const [offs] = await pool.query(
     `SELECT starts_at, ends_at
-     FROM time_off
-    WHERE stylist_id = ?
-      AND starts_at < ?
-      AND ends_at   > ?`,
-    [stylistId, dayClose, dayOpen]
+       FROM time_off
+      WHERE tenant_id=? 
+        AND stylist_id=? 
+        AND starts_at < ? 
+        AND ends_at   > ?`,
+    [tenantId, stylistId, dayClose, dayOpen]
   );
-
-  console.log(`📅 Turnos existentes: ${appts.length}, Ausencias: ${offs.length}`);
 
   const BUFFER_MIN = Number(process.env.APPT_BUFFER_MIN || 0);
   const busy = [
@@ -103,7 +81,7 @@ export async function getFreeSlots({ stylistId, serviceId, date, stepMin }) {
     })),
   ];
 
-  // --- 4) Generar slots sobre CADA intervalo laboral ---
+  // 5) Generar slots por cada intervalo laboral
   const allSlots = new Set();
   const busySlots = new Set();
   const now = new Date();
@@ -118,8 +96,7 @@ export async function getFreeSlots({ stylistId, serviceId, date, stepMin }) {
 
       const start = new Date(t);
       const end = addMinutes(start, blockMin);
-
-      if (start <= now) continue; // no mostrar pasados
+      if (start <= now) continue;
 
       const hh = String(start.getHours()).padStart(2, "0");
       const mm = String(start.getMinutes()).padStart(2, "0");
@@ -135,16 +112,13 @@ export async function getFreeSlots({ stylistId, serviceId, date, stepMin }) {
   const slotsArr = Array.from(allSlots).sort();
   const busyArr = Array.from(busySlots).sort();
 
-  console.log(`\n📊 Resultado: Total ${slotsArr.length}, Ocupados ${busyArr.length}, Libres ${slotsArr.length - busyArr.length}`);
-  console.log(`   Slots libres:`, slotsArr.filter(s => !busyArr.includes(s)));
-
   return { slots: slotsArr, busySlots: busyArr };
-
 }
 
 // GET /api/availability
 availability.get("/availability", async (req, res) => {
   try {
+    const tenantId = req.tenant.id;
     const stylistId = Number(req.query.stylistId);
     const serviceId = Number(req.query.serviceId);
     const date = String(req.query.date || "");
@@ -154,14 +128,10 @@ availability.get("/availability", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Parámetros requeridos: stylistId, serviceId, date" });
     }
 
-    const result = await getFreeSlots({ stylistId, serviceId, date, stepMin });
-
-    console.log("\n✅ [API RESPONSE]");
-    console.log(`   Enviando ${result.slots.length} slots, ${result.busySlots.length} ocupados`);
-
+    const result = await getFreeSlots({ tenantId, stylistId, serviceId, date, stepMin });
     res.json({ ok: true, data: { slots: result.slots, busySlots: result.busySlots } });
   } catch (e) {
-    console.error("\n❌ [GET /api/availability] error:", e);
+    console.error("❌ [GET /api/availability] error:", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });

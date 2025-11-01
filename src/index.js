@@ -24,9 +24,10 @@ import { stylistStats } from "./routes/stylistStats.js";
 import { notifications } from "./routes/notifications.js";
 import { workingHours } from "./routes/workingHours.js";
 import depositsAdmin from "./routes/depositsAdmin.js"; // ✅ Importar depósitos
-
+import { identifyTenant, requireTenant, requireActiveSubscription } from "./auth/tenant.js";
 import { requireAuth, requireRole } from "./auth/middlewares.js";
 import { daysOff } from "./routes/daysOff.js";
+import invoicing from "./routes/invoicing.js";
 
 dotenv.config();
 const app = express();
@@ -61,13 +62,18 @@ app.use(cors({
     allowedHeaders: ["Content-Type", "Authorization"],
 }));
 app.set("trust proxy", 1); // necesario en Render para que secure funcione
+
+
 app.use(express.json());
 app.use(cookieParser());
-
+app.use(identifyTenant);
+app.use("/auth", auth);
+app.use(requireTenant);         // ← bloquea si no hay tenant válido
+app.use(requireActiveSubscription); // ← bloquea si la suscripción está inactiva
 
 // ────── API públicas ──────
 app.use("/api/mp-webhook", mpWebhook);
-app.use("/auth", auth);
+
 app.use("/api/health", health);
 app.use("/api", meta);  // Sirve /services y /stylists
 app.use("/api", availability);  // Sirve /availability
@@ -77,6 +83,7 @@ app.use("/api/whatsapp", whatsapp);
 // ────── API protegidas (JWT requerido) ──────
 app.use("/api/appointments", requireAuth, appointments);
 app.use("/api/calendar", requireAuth, calendar);
+app.use("/api/invoicing", requireAuth, requireRole("admin", "user"), invoicing);
 app.use("/api/customers", requireAuth, requireRole("admin", "user"), customers);
 app.use("/api/payments", requireAuth, requireRole("admin", "user"), payments);
 app.use("/api/config", config);

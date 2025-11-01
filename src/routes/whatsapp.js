@@ -18,7 +18,7 @@ import { cfgNumber } from "../services/config.js"; // ✅ NUEVO: lee el porcenta
 
 
 export const whatsapp = Router();
-
+const TENANT_ID = Number(process.env.BOT_TENANT_ID || 0);
 const TZ_OFFSET = -3; // Argentina UTC-3
 const LEAD_MIN = Number(process.env.BOT_LEAD_MIN || 30); // minutos de anticipación mínima
 
@@ -634,8 +634,8 @@ async function _getSlots(stylistId, serviceId, date) {
 
   // 2) Duración del servicio
   const [[svc]] = await pool.query(
-    "SELECT duration_min FROM service WHERE id=? LIMIT 1",
-    [Number(serviceId)]
+    "SELECT duration_min FROM service WHERE id=? AND tenant_id=? LIMIT 1",
+    [Number(serviceId), TENANT_ID]
   );
   const durMin = Number(svc?.duration_min || 0);
   if (!durMin) return [];
@@ -645,36 +645,36 @@ async function _getSlots(stylistId, serviceId, date) {
     `
       SELECT TIME(starts_at) AS s, TIME(ends_at) AS e
       FROM appointment
-      WHERE stylist_id=?
+     WHERE stylist_id=? AND tenant_id=?
         AND DATE(starts_at)=?
         AND status IN ('scheduled','confirmed','deposit_paid','pending_deposit')
     `,
-    [Number(stylistId), date]
+    [Number(stylistId), TENANT_ID, date]
   );
   const appts = aptRows.map((r) => ({
     start: new Date(`${date}T${String(r.s).slice(0, 5)}:00`),
-    end:   new Date(`${date}T${String(r.e).slice(0, 5)}:00`),
+    end: new Date(`${date}T${String(r.e).slice(0, 5)}:00`),
   }));
 
   // 4) Bloqueos (busy por time_off) — contempla bloqueos que cruzan medianoche
   const dayStart = new Date(`${date}T00:00:00`);
-  const dayEnd   = new Date(`${date}T23:59:59`);
+  const dayEnd = new Date(`${date}T23:59:59`);
   const [offRows] = await pool.query(
     `
       SELECT starts_at AS s, ends_at AS e
       FROM time_off
-      WHERE stylist_id=?
+      WHERE stylist_id=? AND tenant_id=?
         AND starts_at < DATE_ADD(?, INTERVAL 1 DAY)
         AND ends_at   > ?
     `,
-    [Number(stylistId), date, date]
+    [Number(stylistId), TENANT_ID, date, date]
   );
   const offs = offRows.map((r) => {
     const s = new Date(r.s);
     const e = new Date(r.e);
     // Recortar al día consultado por si el bloqueo abarca varios días
     const start = s < dayStart ? dayStart : s;
-    const end   = e > dayEnd   ? dayEnd   : e;
+    const end = e > dayEnd ? dayEnd : e;
     return { start, end };
   });
 
@@ -685,7 +685,7 @@ async function _getSlots(stylistId, serviceId, date) {
   const free = [];
   for (const hhmm of baseSlots) {
     const start = new Date(`${date}T${hhmm}:00`);
-    const end   = new Date(start.getTime() + durMin * 60000);
+    const end = new Date(start.getTime() + durMin * 60000);
 
     const busyAppt = appts.some(({ start: s, end: e }) => overlaps(start, end, s, e));
     if (busyAppt) continue;
@@ -707,7 +707,8 @@ async function _bookWithDeposit(customerPhoneE164, stylistId, serviceId, startsA
     startsAt: startsAtLocal,
     depositDecimal: Number(depositDecimal || 0),
     status: "pending_deposit",         // 👈 clave
-    markDepositAsPaid: false
+    markDepositAsPaid: false,
+    tenantId: TENANT_ID
   });
 }
 

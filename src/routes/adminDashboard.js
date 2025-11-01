@@ -1,200 +1,170 @@
+// src/routes/adminDashboard.js — MULTI-TENANT
 import { Router } from "express";
 import { pool } from "../db.js";
 import { requireAuth, requireRole } from "../auth/middlewares.js";
 
 export const adminDashboard = Router();
+adminDashboard.use(requireAuth, requireRole("admin","user"));
 
-adminDashboard.use(requireAuth, requireRole("admin", "user"));
-
-adminDashboard.get("/", async (req, res) => {
+/**
+ * GET /api/dashboard/summary?date=YYYY-MM-DD
+ * KPIs del día (o de hoy si no viene "date"):
+ * - turnos hoy por estado
+ * - próximos (siguientes 10)
+ * - clientes totales
+ * - monto lista estimado de hoy (sum precio de servicio)
+ */
+adminDashboard.get("/dashboard/summary", async (req, res) => {
   try {
-    const { from, to } = req.query || {};
+    const tenantId = req.tenant.id;
+    const date = (req.query.date || "").toString().slice(0,10);
+    const today = date || new Date().toISOString().slice(0,10);
+    const from = `${today} 00:00:00`;
+    const to   = `${today} 23:59:59`;
 
-    const ACTIVE = ["scheduled", "confirmed", "deposit_paid", "completed", "pending_deposit"];
-    const ACTIVE_NO_PENDING = ["scheduled", "confirmed", "deposit_paid", "completed"];
-
-    const hasRange = Boolean(from && to);
-    const rangeWhere = hasRange ? "a.starts_at BETWEEN ? AND ?" : "1=1";
-    const rangeParams = hasRange ? [`${from} 00:00:00`, `${to} 23:59:59`] : [];
-
-    // ===== HOY / MAÑANA (conteos) =====
-    const [[todayAll]] = await pool.query(
+    // Conteo por estado hoy
+    const [stateRows] = await pool.query(
       `
-      SELECT
-        SUM(CASE WHEN status IN (${ACTIVE.map(() => "?").join(",")}) THEN 1 ELSE 0 END) AS active_total,
-        SUM(CASE WHEN status = 'pending_deposit' THEN 1 ELSE 0 END) AS pending_total,
-        SUM(CASE WHEN status IN (${ACTIVE_NO_PENDING.map(() => "?").join(",")}) THEN 1 ELSE 0 END) AS confirmed_total
-      FROM appointment
-      WHERE DATE(starts_at) = CURDATE()
+      SELECT a.status, COUNT(*) AS cnt
+        FROM appointment a
+       WHERE a.tenant_id = ?
+         AND a.starts_at BETWEEN ? AND ?
+       GROUP BY a.status
       `,
-      [...ACTIVE, ...ACTIVE_NO_PENDING]
+      [tenantId, from, to]
     );
 
-    const [[tomorrowAll]] = await pool.query(
+    // Monto lista estimado hoy (sum precio del servicio)
+    const [[kpiMonto]] = await pool.query(
       `
-      SELECT
-        SUM(CASE WHEN status IN (${ACTIVE.map(() => "?").join(",")}) THEN 1 ELSE 0 END) AS active_total,
-        SUM(CASE WHEN status = 'pending_deposit' THEN 1 ELSE 0 END) AS pending_total,
-        SUM(CASE WHEN status IN (${ACTIVE_NO_PENDING.map(() => "?").join(",")}) THEN 1 ELSE 0 END) AS confirmed_total
-      FROM appointment
-      WHERE DATE(starts_at) = CURDATE() + INTERVAL 1 DAY
+      SELECT COALESCE(SUM(s.price_decimal),0) AS total
+        FROM appointment a
+        JOIN service s ON s.id=a.service_id AND s.tenant_id=a.tenant_id
+       WHERE a.tenant_id=?
+         AND a.starts_at BETWEEN ? AND ?
+         AND a.status IN ('scheduled','pending_deposit','deposit_paid','confirmed','completed')
       `,
-      [...ACTIVE, ...ACTIVE_NO_PENDING]
+      [tenantId, from, to]
     );
 
-    // ===== Clientes =====
-    const [[totalCustomers]] = await pool.query(`SELECT COUNT(*) AS total FROM customer`);
-
-    // ===== Por estilista (desde hoy o rango) =====
-    const [byStylist] = await pool.query(
+    // Próximos 10 turnos (hoy en adelante)
+    const [upcoming] = await pool.query(
       `
-      SELECT
-        st.id,
-        st.name AS stylist,
-        st.color_hex,
-        SUM(CASE WHEN a.status IN (${ACTIVE.map(() => "?").join(",")}) THEN 1 ELSE 0 END) AS total,
-        SUM(CASE WHEN a.status = 'pending_deposit' THEN 1 ELSE 0 END) AS pending,
-        SUM(CASE WHEN a.status IN (${ACTIVE_NO_PENDING.map(() => "?").join(",")}) THEN 1 ELSE 0 END) AS confirmed
-      FROM stylist st
-      LEFT JOIN appointment a ON a.stylist_id = st.id
-        AND ${hasRange ? "a.starts_at BETWEEN ? AND ?" : "a.starts_at >= CURDATE()"}
-      GROUP BY st.id, st.name, st.color_hex
-      ORDER BY st.name
+      SELECT a.id, a.starts_at, a.ends_at, a.status,
+             s.name AS service, st.name AS stylist,
+             c.name AS customer, c.phone_e164 AS phone
+        FROM appointment a
+        JOIN service  s  ON s.id=a.service_id  AND s.tenant_id=a.tenant_id
+        JOIN stylist  st ON st.id=a.stylist_id AND st.tenant_id=a.tenant_id
+        LEFT JOIN customer c ON c.id=a.customer_id AND c.tenant_id=a.tenant_id
+       WHERE a.tenant_id=?
+         AND a.starts_at >= ?
+       ORDER BY a.starts_at ASC
+       LIMIT 10
       `,
-      [
-        ...ACTIVE,
-        ...ACTIVE_NO_PENDING,
-        ...(hasRange ? [`${from} 00:00:00`, `${to} 23:59:59`] : []),
-      ]
+      [tenantId, from]
     );
 
-    // ===== Recaudación por SEÑAS =====
-    // Hoy (deposit_paid_at hoy)
-    const [[todayDeposits]] = await pool.query(
-      `
-      SELECT
-        COALESCE(SUM(deposit_decimal), 0) AS amount,
-        COUNT(*) AS count
-      FROM appointment
-      WHERE deposit_paid_at IS NOT NULL
-        AND DATE(deposit_paid_at) = CURDATE()
-      `
-    );
-
-    // En el rango (si viene), si no: desde inicio del mes actual
-    const depositsRangeWhere = hasRange
-      ? "deposit_paid_at BETWEEN ? AND ?"
-      : "deposit_paid_at >= DATE_FORMAT(CURDATE(), '%Y-%m-01')";
-    const depositsRangeParams = hasRange
-      ? [`${from} 00:00:00`, `${to} 23:59:59`]
-      : [];
-    const [[rangeDeposits]] = await pool.query(
-      `
-      SELECT
-        COALESCE(SUM(deposit_decimal), 0) AS amount,
-        COUNT(*) AS count
-      FROM appointment
-      WHERE deposit_paid_at IS NOT NULL
-        AND ${depositsRangeWhere}
-      `,
-      depositsRangeParams
-    );
-
-    // ===== Facturación (servicios) =====
-    // Realizada: servicios COMPLETED en el rango (o mes actual)
-    const revenueRangeWhere = hasRange ? rangeWhere : "a.starts_at >= DATE_FORMAT(CURDATE(), '%Y-%m-01')";
-    const revenueRangeParams = hasRange ? rangeParams : [];
-    const [[realizedRevenue]] = await pool.query(
-      `
-      SELECT
-        COALESCE(SUM(s.price_decimal), 0) AS amount,
-        COUNT(*) AS count
-      FROM appointment a
-      JOIN service s ON s.id = a.service_id
-      WHERE ${revenueRangeWhere}
-        AND a.status = 'completed'
-      `,
-      revenueRangeParams
-    );
-
-    // Proyección: turnos no cancelados y no pendientes (según ACTIVE_NO_PENDING)
-    const [[projectedRevenue]] = await pool.query(
-      `
-      SELECT
-        COALESCE(SUM(s.price_decimal), 0) AS amount,
-        COUNT(*) AS count
-      FROM appointment a
-      JOIN service s ON s.id = a.service_id
-      WHERE ${revenueRangeWhere}
-        AND a.status IN (${ACTIVE_NO_PENDING.map(() => "?").join(",")})
-      `,
-      [...revenueRangeParams, ...ACTIVE_NO_PENDING]
-    );
-
-    // ===== Señales por vencer / vencidas =====
-    const [[holdsSoon]] = await pool.query(
-      `
-      SELECT COUNT(*) AS soon
-      FROM appointment
-      WHERE status = 'pending_deposit'
-        AND hold_until IS NOT NULL
-        AND hold_until > NOW()
-        AND hold_until <= DATE_ADD(NOW(), INTERVAL 2 HOUR)
-      `
-    );
-    const [[holdsExpired]] = await pool.query(
-      `
-      SELECT COUNT(*) AS expired
-      FROM appointment
-      WHERE status = 'pending_deposit'
-        AND hold_until IS NOT NULL
-        AND hold_until <= NOW()
-      `
+    // Total de clientes
+    const [[custCount]] = await pool.query(
+      `SELECT COUNT(*) AS total FROM customer WHERE tenant_id=?`,
+      [tenantId]
     );
 
     res.json({
       ok: true,
+      date: today,
       data: {
-        today: {
-          total: Number(todayAll.active_total || 0),
-          pending: Number(todayAll.pending_total || 0),
-          confirmed: Number(todayAll.confirmed_total || 0),
-        },
-        tomorrow: {
-          total: Number(tomorrowAll.active_total || 0),
-          pending: Number(tomorrowAll.pending_total || 0),
-          confirmed: Number(tomorrowAll.confirmed_total || 0),
-        },
-        customers: Number(totalCustomers.total || 0),
-        byStylist: byStylist.map((r) => ({
-          stylistId: r.id,
-          stylist: r.stylist,
-          color_hex: r.color_hex,
-          total: Number(r.total || 0),
-          pending: Number(r.pending || 0),
-          confirmed: Number(r.confirmed || 0),
-        })),
-        deposits: {
-          todayAmount: Number(todayDeposits.amount || 0),
-          todayCount: Number(todayDeposits.count || 0),
-          rangeAmount: Number(rangeDeposits.amount || 0),
-          rangeCount: Number(rangeDeposits.count || 0),
-        },
-        revenue: {
-          realizedAmount: Number(realizedRevenue.amount || 0),
-          realizedCount: Number(realizedRevenue.count || 0),
-          projectedAmount: Number(projectedRevenue.amount || 0),
-          projectedCount: Number(projectedRevenue.count || 0),
-        },
-        holds: {
-          expiringSoon: Number(holdsSoon.soon || 0),
-          expired: Number(holdsExpired.expired || 0),
-        },
-        range: hasRange ? { from, to } : { from: null, to: null },
-      },
+        byStatus: stateRows.reduce((acc, r) => (acc[r.status] = Number(r.cnt), acc), {}),
+        upcoming,
+        customersTotal: Number(custCount?.total || 0),
+        amountToday: Number(kpiMonto?.total || 0)
+      }
     });
   } catch (e) {
-    console.error("[DASHBOARD] error:", e);
-    res.status(500).json({ ok: false, error: e.message });
+    console.error("[GET /dashboard/summary] error:", e);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+/**
+ * GET /api/dashboard/stylists?from=YYYY-MM-DD&to=YYYY-MM-DD
+ * KPIs por estilista en rango: cantidad, monto lista, primera y última hora
+ */
+adminDashboard.get("/dashboard/stylists", async (req, res) => {
+  try {
+    const tenantId = req.tenant.id;
+    const from = (req.query.from || "").toString().slice(0,10);
+    const to   = (req.query.to   || "").toString().slice(0,10);
+
+    const fromTs = `${from || new Date().toISOString().slice(0,10)} 00:00:00`;
+    const toTs   = `${to   || new Date().toISOString().slice(0,10)} 23:59:59`;
+
+    const [rows] = await pool.query(
+      `
+      SELECT 
+        st.id   AS stylist_id,
+        st.name AS stylist_name,
+        COUNT(*) AS count,
+        COALESCE(SUM(s.price_decimal),0) AS amount,
+        MIN(a.starts_at) AS first_start,
+        MAX(a.ends_at)   AS last_end
+      FROM appointment a
+      JOIN stylist st ON st.id=a.stylist_id AND st.tenant_id=a.tenant_id
+      JOIN service  s ON s.id=a.service_id  AND s.tenant_id=a.tenant_id
+      WHERE a.tenant_id=?
+        AND a.starts_at BETWEEN ? AND ?
+        AND a.status IN ('scheduled','pending_deposit','deposit_paid','confirmed','completed')
+      GROUP BY st.id
+      ORDER BY amount DESC, count DESC
+      `,
+      [tenantId, fromTs, toTs]
+    );
+
+    res.json({ ok:true, from:fromTs.slice(0,10), to:toTs.slice(0,10), data: rows });
+  } catch (e) {
+    console.error("[GET /dashboard/stylists] error:", e);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+/**
+ * GET /api/dashboard/today-vs-tomorrow
+ * Comparativo de cantidad de turnos (hoy vs mañana)
+ */
+adminDashboard.get("/dashboard/today-vs-tomorrow", async (req, res) => {
+  try {
+    const tenantId = req.tenant.id;
+    const today = new Date();
+    const yyyy = today.getFullYear();
+    const mm = String(today.getMonth()+1).padStart(2,"0");
+    const dd = String(today.getDate()).padStart(2,"0");
+    const todayStr = `${yyyy}-${mm}-${dd}`;
+
+    const tomorrow = new Date(today.getTime()+86400000);
+    const y2 = tomorrow.getFullYear();
+    const m2 = String(tomorrow.getMonth()+1).padStart(2,"0");
+    const d2 = String(tomorrow.getDate()).padStart(2,"0");
+    const tomorrowStr = `${y2}-${m2}-${d2}`;
+
+    const [[r1]] = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM appointment WHERE tenant_id=? AND starts_at BETWEEN ? AND ?`,
+      [tenantId, `${todayStr} 00:00:00`, `${todayStr} 23:59:59`]
+    );
+    const [[r2]] = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM appointment WHERE tenant_id=? AND starts_at BETWEEN ? AND ?`,
+      [tenantId, `${tomorrowStr} 00:00:00`, `${tomorrowStr} 23:59:59`]
+    );
+
+    res.json({
+      ok:true,
+      data: {
+        today: { date: todayStr, count: Number(r1?.cnt || 0) },
+        tomorrow: { date: tomorrowStr, count: Number(r2?.cnt || 0) }
+      }
+    });
+  } catch (e) {
+    console.error("[GET /dashboard/today-vs-tomorrow] error:", e);
+    res.status(500).json({ ok:false, error:e.message });
   }
 });

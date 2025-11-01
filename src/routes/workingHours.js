@@ -27,9 +27,9 @@ workingHours.get("/", async (req, res) => {
     const [rows] = await pool.query(
       `SELECT stylist_id, weekday, start_time, end_time
        FROM working_hours
-       WHERE stylist_id = ?
+       WHERE stylist_id = ? AND tenant_id = ?
        ORDER BY weekday ASC`,
-      [stylistId]
+      [stylistId, req.tenant.id]
     );
     const data = ensureSevenDays(rows, stylistId);
     return res.json({ ok: true, data });
@@ -45,7 +45,7 @@ workingHours.put("/", async (req, res) => {
   try {
     const stylistId = Number(req.body?.stylistId);
     const hours = Array.isArray(req.body?.hours) ? req.body.hours : null;
-
+    const tenantId = req.tenant.id;
     if (!stylistId) return res.status(400).json({ ok: false, error: "Falta stylistId" });
     if (!hours || hours.length !== 7)
       return res.status(400).json({ ok: false, error: "Debe enviar 7 items en 'hours' (0..6)" });
@@ -60,7 +60,7 @@ workingHours.put("/", async (req, res) => {
       let start = h.start_time;
       let end = h.end_time;
       start = (start === "" || start === undefined) ? null : start;
-      end   = (end   === "" || end   === undefined) ? null : end;
+      end = (end === "" || end === undefined) ? null : end;
 
       // Si uno es null, ambos a null (franco)
       if (start == null || end == null) {
@@ -84,9 +84,8 @@ workingHours.put("/", async (req, res) => {
 
         // ¿ya existe fila?
         const [[exists]] = await conn.query(
-          `SELECT id FROM working_hours WHERE stylist_id=? AND weekday=?`,
-          [stylistId, weekday]
-        );
+          `SELECT id FROM working_hours WHERE stylist_id=? AND tenant_id=? AND weekday=?`,
+          [stylistId, tenantId, weekday]);
 
         if (exists) {
           await conn.query(
@@ -97,9 +96,9 @@ workingHours.put("/", async (req, res) => {
           );
         } else {
           await conn.query(
-            `INSERT INTO working_hours (stylist_id, weekday, start_time, end_time)
-             VALUES (?,?,?,?)`,
-            [stylistId, weekday, start_time, end_time]
+            `INSERT INTO working_hours (tenant_id, stylist_id, weekday, start_time, end_time)
+           VALUES (?,?,?,?,?)`,
+            [tenantId, stylistId, weekday, start_time, end_time]
           );
         }
       }

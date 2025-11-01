@@ -1,422 +1,169 @@
-// src/routes/depositsAdmin.js - API completa para gestión de depósitos
+// src/routes/depositsAdmin.js — MULTI-TENANT
 import { Router } from "express";
 import { pool } from "../db.js";
 import { requireAuth, requireRole } from "../auth/middlewares.js";
 
 export const depositsAdmin = Router();
-depositsAdmin.use(requireAuth, requireRole("admin", "user"));
+depositsAdmin.use(requireAuth, requireRole("admin","user"));
 
-// ============================================
-// DASHBOARD - Métricas principales
-// ============================================
-depositsAdmin.get("/dashboard", async (req, res) => {
+/**
+ * GET /api/deposits?status=pending|paid|all&from=YYYY-MM-DD&to=YYYY-MM-DD&stylistId=#
+ * Lista señas (turnos con depósito configurado)
+ */
+depositsAdmin.get("/deposits", async (req, res) => {
   try {
-    const conn = await pool.getConnection();
-    
-    try {
-      // Stats generales
-      const [[stats]] = await conn.query(`
-        SELECT
-          SUM(CASE 
-            WHEN status = 'pending_deposit' 
-            AND hold_until > NOW() 
-            THEN 1 ELSE 0 
-          END) AS pendingActive,
-          
-          SUM(CASE 
-            WHEN status = 'pending_deposit' 
-            AND hold_until <= NOW() 
-            THEN 1 ELSE 0 
-          END) AS pendingExpired,
-          
-          SUM(CASE 
-            WHEN status = 'pending_deposit' 
-            THEN COALESCE(deposit_decimal, 0) ELSE 0 
-          END) AS amountHeld,
-          
-          SUM(CASE 
-            WHEN deposit_paid_at IS NOT NULL 
-            AND DATE(deposit_paid_at) = CURDATE() 
-            THEN 1 ELSE 0 
-          END) AS paidToday,
-          
-          SUM(CASE 
-            WHEN status = 'cancelled' 
-            AND DATE(updated_at) = CURDATE() 
-            AND hold_until IS NOT NULL 
-            THEN 1 ELSE 0 
-          END) AS cancelledToday
-        FROM appointment
-      `);
+    const tenantId = req.tenant.id;
+    const status = String(req.query.status || "pending");
+    const from = (req.query.from || "").toString().slice(0,10);
+    const to   = (req.query.to   || "").toString().slice(0,10);
+    const stylistId = req.query.stylistId ? Number(req.query.stylistId) : null;
 
-      // Turnos próximos a vencer (< 2 horas)
-      const [expiringSoon] = await conn.query(`
-        SELECT 
-          a.id,
-          a.hold_until,
-          c.name AS customer_name,
-          s.name AS service_name,
-          TIMESTAMPDIFF(MINUTE, NOW(), a.hold_until) AS minutes_left
-        FROM appointment a
-        JOIN customer c ON c.id = a.customer_id
-        JOIN service s ON s.id = a.service_id
-        WHERE a.status = 'pending_deposit'
-          AND a.hold_until > NOW()
-          AND a.hold_until <= DATE_ADD(NOW(), INTERVAL 2 HOUR)
-        ORDER BY a.hold_until ASC
-      `);
+    const fromTs = from ? `${from} 00:00:00` : "1970-01-01 00:00:00";
+    const toTs   = to   ? `${to} 23:59:59` : "2999-12-31 23:59:59";
 
-      // Pagos recientes (últimas 24hs)
-      const [recentPayments] = await conn.query(`
-        SELECT 
-          a.id,
-          a.deposit_decimal,
-          a.deposit_paid_at,
-          c.name AS customer_name,
-          s.name AS service_name
-        FROM appointment a
-        JOIN customer c ON c.id = a.customer_id
-        JOIN service s ON s.id = a.service_id
-        WHERE a.deposit_paid_at IS NOT NULL
-          AND a.deposit_paid_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-        ORDER BY a.deposit_paid_at DESC
-        LIMIT 10
-      `);
-
-      res.json({
-        ok: true,
-        data: {
-          stats: {
-            pendingActive: Number(stats.pendingActive || 0),
-            pendingExpired: Number(stats.pendingExpired || 0),
-            amountHeld: Number(stats.amountHeld || 0),
-            paidToday: Number(stats.paidToday || 0),
-            cancelledToday: Number(stats.cancelledToday || 0),
-          },
-          expiringSoon,
-          recentPayments,
-        },
-      });
-    } finally {
-      conn.release();
-    }
-  } catch (e) {
-    console.error("[DEPOSITS/DASHBOARD] error:", e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ============================================
-// PENDING - Lista de señas pendientes
-// ============================================
-depositsAdmin.get("/pending", async (req, res) => {
-  try {
-    const includeExpired = req.query.includeExpired === "true";
-    
-    const whereClause = includeExpired
-      ? "a.status = 'pending_deposit'"
-      : "a.status = 'pending_deposit' AND a.hold_until > NOW()";
-
-    const [deposits] = await pool.query(`
+    let sql = `
       SELECT 
-        a.id,
-        a.starts_at,
-        a.hold_until,
-        a.deposit_decimal,
-        c.name AS customer_name,
-        c.phone_e164,
-        s.name AS service_name,
-        st.name AS stylist_name,
-        CASE
-          WHEN a.hold_until <= NOW() THEN 'expired'
-          WHEN a.hold_until <= DATE_ADD(NOW(), INTERVAL 2 HOUR) THEN 'expiring'
-          ELSE 'active'
-        END AS urgency
+        a.id, a.starts_at, a.ends_at, a.status,
+        a.deposit_decimal, a.deposit_paid_at, a.hold_until,
+        s.name AS service, st.name AS stylist,
+        c.name AS customer, c.phone_e164 AS phone
       FROM appointment a
-      JOIN customer c ON c.id = a.customer_id
-      JOIN service s ON s.id = a.service_id
-      JOIN stylist st ON st.id = a.stylist_id
-      WHERE ${whereClause}
-      ORDER BY 
-        CASE
-          WHEN a.hold_until <= NOW() THEN 0
-          WHEN a.hold_until <= DATE_ADD(NOW(), INTERVAL 2 HOUR) THEN 1
-          ELSE 2
-        END,
-        a.hold_until ASC
-    `);
+      JOIN service  s  ON s.id=a.service_id  AND s.tenant_id=a.tenant_id
+      JOIN stylist  st ON st.id=a.stylist_id AND st.tenant_id=a.tenant_id
+      LEFT JOIN customer c ON c.id=a.customer_id AND c.tenant_id=a.tenant_id
+      WHERE a.tenant_id=?
+        AND a.deposit_decimal IS NOT NULL
+        AND a.starts_at BETWEEN ? AND ?
+    `;
+    const params = [tenantId, fromTs, toTs];
 
-    res.json({ ok: true, data: deposits });
-  } catch (e) {
-    console.error("[DEPOSITS/PENDING] error:", e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ============================================
-// ACTIONS - Acciones sobre depósitos
-// ============================================
-
-// Marcar como pagado
-depositsAdmin.post("/:id/mark-paid", async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    await pool.query(`
-      UPDATE appointment
-      SET 
-        status = 'deposit_paid',
-        deposit_paid_at = NOW(),
-        hold_until = NULL
-      WHERE id = ? AND status = 'pending_deposit'
-    `, [id]);
-
-    // Registrar en actividad
-    await logActivity({
-      type: "deposit_paid",
-      appointmentId: id,
-      userId: req.user.id,
-      description: "Seña marcada como pagada manualmente",
-    });
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("[DEPOSITS/MARK-PAID] error:", e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// Cancelar turno
-depositsAdmin.post("/:id/cancel", async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    await pool.query(`
-      UPDATE appointment
-      SET status = 'cancelled'
-      WHERE id = ?
-    `, [id]);
-
-    // Registrar en actividad
-    await logActivity({
-      type: "appointment_cancelled",
-      appointmentId: id,
-      userId: req.user.id,
-      description: "Turno cancelado por timeout de seña",
-    });
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("[DEPOSITS/CANCEL] error:", e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// Extender tiempo de hold
-depositsAdmin.post("/:id/extend", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const minutes = Number(req.body.minutes || 30);
-    
-    await pool.query(`
-      UPDATE appointment
-      SET hold_until = DATE_ADD(COALESCE(hold_until, NOW()), INTERVAL ? MINUTE)
-      WHERE id = ? AND status = 'pending_deposit'
-    `, [minutes, id]);
-
-    // Registrar en actividad
-    await logActivity({
-      type: "deposit_extended",
-      appointmentId: id,
-      userId: req.user.id,
-      description: `Tiempo de hold extendido ${minutes} minutos`,
-    });
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("[DEPOSITS/EXTEND] error:", e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// Enviar recordatorio
-depositsAdmin.post("/:id/remind", async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    // Aquí irían las integraciones con WhatsApp/SMS
-    // Por ahora solo registramos la acción
-    
-    await logActivity({
-      type: "reminder_sent",
-      appointmentId: id,
-      userId: req.user.id,
-      description: "Recordatorio de pago enviado",
-    });
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("[DEPOSITS/REMIND] error:", e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ============================================
-// CONFIG - Configuración del sistema
-// ============================================
-depositsAdmin.get("/config", async (req, res) => {
-  try {
-    const [rows] = await pool.query(`
-      SELECT config_key, config_value, updated_at
-      FROM system_config
-      WHERE config_key LIKE 'deposit_%'
-      ORDER BY config_key
-    `);
-
-    // Convertir array a objeto
-    const config = rows.reduce((acc, row) => {
-      const key = row.config_key.replace("deposit_", "");
-      let value = row.config_value;
-      
-      // Parse JSON values
-      try {
-        value = JSON.parse(value);
-      } catch {}
-      
-      acc[key] = value;
-      return acc;
-    }, {});
-
-    // Valores por defecto si no existen
-    const defaultConfig = {
-      percentage: 50,
-      hold_minutes: 30,
-      expiration_before_start_minutes: 120,
-      auto_cancel: true,
-      notifications: {
-        expiringSoon: true,
-        expired: true,
-        paid: true,
-      },
-    };
-
-    res.json({ 
-      ok: true, 
-      data: { ...defaultConfig, ...config } 
-    });
-  } catch (e) {
-    console.error("[DEPOSITS/CONFIG/GET] error:", e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-depositsAdmin.post("/config", async (req, res) => {
-  try {
-    const config = req.body;
-    const conn = await pool.getConnection();
-    
-    try {
-      await conn.beginTransaction();
-      
-      // Guardar cada configuración
-      for (const [key, value] of Object.entries(config)) {
-        const configKey = `deposit_${key}`;
-        const configValue = typeof value === "object" 
-          ? JSON.stringify(value) 
-          : String(value);
-        
-        await conn.query(`
-          INSERT INTO system_config (config_key, config_value)
-          VALUES (?, ?)
-          ON DUPLICATE KEY UPDATE
-            config_value = VALUES(config_value),
-            updated_at = NOW()
-        `, [configKey, configValue]);
-      }
-      
-      // Registrar cambio en actividad
-      await logActivity({
-        type: "config_changed",
-        userId: req.user.id,
-        description: "Configuración de depósitos actualizada",
-        details: JSON.stringify(config),
-      }, conn);
-      
-      await conn.commit();
-      res.json({ ok: true });
-    } catch (e) {
-      await conn.rollback();
-      throw e;
-    } finally {
-      conn.release();
+    if (status === "pending") {
+      sql += " AND a.status IN ('pending_deposit')";
+    } else if (status === "paid") {
+      sql += " AND a.status IN ('deposit_paid','confirmed','completed') AND a.deposit_paid_at IS NOT NULL";
     }
+    if (stylistId) {
+      sql += " AND a.stylist_id = ?";
+      params.push(stylistId);
+    }
+
+    sql += " ORDER BY a.starts_at ASC";
+
+    const [rows] = await pool.query(sql, params);
+    res.json({ ok:true, data: rows });
   } catch (e) {
-    console.error("[DEPOSITS/CONFIG/POST] error:", e);
-    res.status(500).json({ ok: false, error: e.message });
+    console.error("[GET /deposits] error:", e);
+    res.status(500).json({ ok:false, error:e.message });
   }
 });
 
-// ============================================
-// ACTIVITY - Registro de actividad
-// ============================================
-depositsAdmin.get("/activity", async (req, res) => {
+/**
+ * POST /api/deposits/:appointmentId/confirm
+ * Body: { amount_decimal? } — marca la seña como pagada (manual/caja)
+ */
+depositsAdmin.post("/deposits/:appointmentId/confirm", async (req, res) => {
+  const conn = await pool.getConnection();
   try {
-    const limit = Number(req.query.limit || 50);
-    const offset = Number(req.query.offset || 0);
-    
-    const [activities] = await pool.query(`
-      SELECT 
-        al.id,
-        al.type,
-        al.description,
-        al.details,
-        al.created_at,
-        al.appointment_id,
-        u.email AS user_email,
-        u.full_name AS user_name,
-        c.name AS customer_name
-      FROM activity_log al
-      LEFT JOIN users u ON u.id = al.user_id
-      LEFT JOIN appointment a ON a.id = al.appointment_id
-      LEFT JOIN customer c ON c.id = a.customer_id
-      WHERE al.module = 'deposits'
-      ORDER BY al.created_at DESC
-      LIMIT ? OFFSET ?
-    `, [limit, offset]);
+    const tenantId = req.tenant.id;
+    const apptId = Number(req.params.appointmentId);
+    const amountDecimal = req.body?.amount_decimal != null ? Number(req.body.amount_decimal) : null;
 
-    // Formatear para el frontend
-    const formatted = activities.map(act => ({
-      id: act.id,
-      type: act.type,
-      description: act.description,
-      details: act.details,
-      created_at: act.created_at,
-      user: act.user_name || act.user_email || "Sistema",
-      customer: act.customer_name,
-    }));
+    await conn.beginTransaction();
 
-    res.json({ ok: true, data: formatted });
+    const [[appt]] = await conn.query(
+      `SELECT id, status, deposit_decimal FROM appointment WHERE id=? AND tenant_id=? FOR UPDATE`,
+      [apptId, tenantId]
+    );
+    if (!appt) {
+      await conn.rollback();
+      return res.status(404).json({ ok:false, error:"Turno no encontrado en tu cuenta" });
+    }
+    if (appt.deposit_decimal == null && amountDecimal == null) {
+      await conn.rollback();
+      return res.status(400).json({ ok:false, error:"El turno no tenía seña configurada. Enviá amount_decimal." });
+    }
+
+    const depositToSet = amountDecimal != null ? amountDecimal : Number(appt.deposit_decimal || 0);
+
+    // Registrar pago (opcional) en tabla payment
+    await conn.query(
+      `INSERT INTO payment (tenant_id, appointment_id, method, amount_cents, currency, created_at)
+       VALUES (?,?,?,?, 'ARS', NOW())`,
+      [tenantId, apptId, 'manual', Math.round(depositToSet * 100)]
+    );
+
+    // Marcar turno como pagado
+    await conn.query(
+      `UPDATE appointment
+          SET deposit_decimal = ?,
+              deposit_paid_at = COALESCE(deposit_paid_at, NOW()),
+              hold_until = NULL,
+              status = CASE 
+                         WHEN status='pending_deposit' THEN 'deposit_paid'
+                         ELSE status
+                       END
+        WHERE id=? AND tenant_id=?`,
+      [depositToSet, apptId, tenantId]
+    );
+
+    await conn.commit();
+    res.json({ ok:true, message:"Seña confirmada" });
   } catch (e) {
-    console.error("[DEPOSITS/ACTIVITY] error:", e);
-    res.status(500).json({ ok: false, error: e.message });
+    await conn.rollback();
+    console.error("[POST /deposits/:id/confirm] error:", e);
+    res.status(500).json({ ok:false, error:e.message });
+  } finally {
+    conn.release();
   }
 });
 
-// ============================================
-// HELPER: Registrar actividad
-// ============================================
-async function logActivity({
-  type,
-  appointmentId = null,
-  userId = null,
-  description,
-  details = null,
-}, conn = pool) {
-  await conn.query(`
-    INSERT INTO activity_log 
-    (module, type, appointment_id, user_id, description, details, created_at)
-    VALUES ('deposits', ?, ?, ?, ?, ?, NOW())
-  `, [type, appointmentId, userId, description, details]);
-}
+/**
+ * POST /api/deposits/:appointmentId/cancel
+ * Cancela un turno "pendiente de seña" y libera el lugar.
+ */
+depositsAdmin.post("/deposits/:appointmentId/cancel", async (req, res) => {
+  try {
+    const tenantId = req.tenant.id;
+    const apptId = Number(req.params.appointmentId);
 
-export default depositsAdmin;
+    // Solo permite cancelar si sigue pendiente
+    const [r] = await pool.query(
+      `UPDATE appointment
+          SET status='cancelled', hold_until=NULL
+        WHERE id=? AND tenant_id=? AND status='pending_deposit'`,
+      [apptId, tenantId]
+    );
+
+    if (!r.affectedRows) {
+      return res.status(400).json({ ok:false, error:"No se pudo cancelar (¿ya no está pendiente?)" });
+    }
+
+    res.json({ ok:true, message:"Turno cancelado y lugar liberado" });
+  } catch (e) {
+    console.error("[POST /deposits/:id/cancel] error:", e);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+/**
+ * POST /api/deposits/expire-holds
+ * Cancela automáticamente turnos pendientes cuya reserva expiró (hold_until < NOW()).
+ */
+depositsAdmin.post("/deposits/expire-holds", async (req, res) => {
+  try {
+    const tenantId = req.tenant.id;
+    const [r] = await pool.query(
+      `UPDATE appointment
+          SET status='cancelled', hold_until=NULL
+        WHERE tenant_id=?
+          AND status='pending_deposit'
+          AND hold_until IS NOT NULL
+          AND hold_until < NOW()`,
+      [tenantId]
+    );
+    res.json({ ok:true, affected: r.affectedRows });
+  } catch (e) {
+    console.error("[POST /deposits/expire-holds] error:", e);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});

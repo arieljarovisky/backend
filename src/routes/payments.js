@@ -3,7 +3,7 @@ import { pool } from "../db.js";
 import { requireAuth, requireRole } from "../auth/middlewares.js";
 export const payments = Router();
 
-payments.post("/", requireAuth, requireRole("admin","user"), async (req, res) => {
+payments.post("/", requireAuth, requireRole("admin", "user"), async (req, res) => {
   try {
     const {
       appointmentId = null,
@@ -16,18 +16,18 @@ payments.post("/", requireAuth, requireRole("admin","user"), async (req, res) =>
     } = req.body || {};
 
     if (!method || !amount_cents) {
-      return res.status(400).json({ ok:false, error:"method y amount_cents requeridos" });
+      return res.status(400).json({ ok: false, error: "method y amount_cents requeridos" });
     }
-
+    const tenantId = req.tenant.id;
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
 
       await conn.query(
         `INSERT INTO payment
-         (appointment_id, method, amount_cents, currency, recorded_by, notes, created_at)
-         VALUES (?,?,?,?,?,?,NOW())`,
-        [appointmentId, method, Number(amount_cents), currency, recorded_by, notes]
+         (tenant_id, appointment_id, method, amount_cents, currency, recorded_by, notes, created_at)
+      VALUES (?,?,?,?,?,?,?,NOW())`,
+        [tenantId, appointmentId, method, Number(amount_cents), currency, recorded_by, notes]
       );
 
       if (appointmentId && markDepositAsPaid) {
@@ -37,13 +37,13 @@ payments.post("/", requireAuth, requireRole("admin","user"), async (req, res) =>
                  deposit_paid_at = COALESCE(deposit_paid_at, NOW()),
                  hold_until = NULL,
                  status = CASE WHEN status='pending_deposit' THEN 'deposit_paid' ELSE status END
-           WHERE id=?`,
-          [ Number(amount_cents) / 100, appointmentId ]
+          WHERE id=? AND tenant_id=?`,
+          [Number(amount_cents) / 100, appointmentId, tenantId]
         );
       }
 
       await conn.commit();
-      res.json({ ok:true });
+      res.json({ ok: true });
     } catch (e) {
       await conn.rollback();
       throw e;
@@ -51,6 +51,6 @@ payments.post("/", requireAuth, requireRole("admin","user"), async (req, res) =>
       conn.release();
     }
   } catch (e) {
-    res.status(500).json({ ok:false, error: e.message });
+    res.status(500).json({ ok: false, error: e.message });
   }
 });

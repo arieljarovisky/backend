@@ -1,81 +1,92 @@
-// src/routes/config.js  (EXTENSIÓN)
+// src/routes/config.js — MULTI-TENANT
 import { Router } from "express";
 import { pool } from "../db.js";
 import { requireAuth, requireAdmin } from "../auth/middlewares.js";
 import { getConfigSnapshot } from "../services/config.js";
 
-
 export const config = Router();
+config.use(requireAuth, requireAdmin);
 
-async function getSection(section) {
+function parseVal(v) {
+  if (v === "true") return true;
+  if (v === "false") return false;
+  if (typeof v === "string" && v.trim() !== "" && !Number.isNaN(Number(v))) return Number(v);
+  return v;
+}
+async function getSection(tenantId, section) {
   const [rows] = await pool.query(
-    "SELECT config_key, config_value FROM system_config WHERE config_key LIKE ?",
-    [`${section}.%`]
+    "SELECT config_key, config_value FROM system_config WHERE tenant_id = ? AND config_key LIKE ?",
+    [tenantId, `${section}.%`]
   );
   const out = {};
   for (const r of rows) out[r.config_key.replace(`${section}.`, "")] = parseVal(r.config_value);
   return out;
 }
-function parseVal(v) {
-  if (v === "true") return true;
-  if (v === "false") return false;
-  if (!Number.isNaN(Number(v)) && v.trim() !== "") return Number(v);
-  return v;
-}
-async function saveSection(section, body) {
+async function saveSection(tenantId, section, body) {
   const entries = Object.entries(body || {});
   for (const [key, val] of entries) {
-    await pool.query(`
-      INSERT INTO system_config (config_key, config_value)
-      VALUES (?, ?)
+    await pool.query(
+      `
+      INSERT INTO system_config (tenant_id, config_key, config_value)
+      VALUES (?, ?, ?)
       ON DUPLICATE KEY UPDATE config_value=VALUES(config_value)
-    `, [`${section}.${key}`, String(val)]);
+      `,
+      [tenantId, `${section}.${key}`, String(val)]
+    );
   }
 }
 
 /** ====== GENERAL ====== */
-config.get("/general", requireAuth, requireAdmin, async (_req, res) => {
-  res.json(await getSection("general"));
+config.get("/general", async (req, res) => {
+  res.json(await getSection(req.tenant.id, "general"));
 });
-config.put("/general", requireAuth, requireAdmin, async (req, res) => {
-  await saveSection("general", req.body);
+config.put("/general", async (req, res) => {
+  await saveSection(req.tenant.id, "general", req.body);
+  // Si cacheás, refrescá acá también si corresponde
   res.json({ ok: true });
 });
 
-/** ====== DEPOSIT (ya existía, compat conservada) ====== */
-config.get("/deposit", requireAuth, requireAdmin, async (_req, res) => {
-  const [rows] = await pool.query("SELECT config_key, config_value FROM system_config");
+/** ====== DEPOSIT ====== (compat mantenida pero scopiada) */
+config.get("/deposit", async (req, res) => {
+  const tenantId = req.tenant.id;
+  const [rows] = await pool.query(
+    "SELECT config_key, config_value FROM system_config WHERE tenant_id = ?",
+    [tenantId]
+  );
   const map = Object.fromEntries(rows.map(r => [r.config_key, r.config_value]));
   res.json(map);
 });
-config.put("/deposit", requireAuth, requireAdmin, async (req, res) => {
+config.put("/deposit", async (req, res) => {
+  const tenantId = req.tenant.id;
   const entries = Object.entries(req.body || {});
   for (const [key, val] of entries) {
-    await pool.query(`
-      INSERT INTO system_config (config_key, config_value)
-      VALUES (?, ?)
+    await pool.query(
+      `
+      INSERT INTO system_config (tenant_id, config_key, config_value)
+      VALUES (?, ?, ?)
       ON DUPLICATE KEY UPDATE config_value=VALUES(config_value)
-    `, [key, String(val)]);
+      `,
+      [tenantId, key, String(val)]
+    );
   }
-  // 🔄 refrescar caché para que el nuevo valor (ej. 80%) impacte al instante
-  await getConfigSnapshot(true);
+  await getConfigSnapshot(true, tenantId); // refrescar caché del tenant
   res.json({ ok: true });
 });
 
 /** ====== COMMISSIONS ====== */
-config.get("/commissions", requireAuth, requireAdmin, async (_req, res) => {
-  res.json(await getSection("commissions"));
+config.get("/commissions", async (req, res) => {
+  res.json(await getSection(req.tenant.id, "commissions"));
 });
-config.put("/commissions", requireAuth, requireAdmin, async (req, res) => {
-  await saveSection("commissions", req.body);
+config.put("/commissions", async (req, res) => {
+  await saveSection(req.tenant.id, "commissions", req.body);
   res.json({ ok: true });
 });
 
 /** ====== NOTIFICATIONS ====== */
-config.get("/notifications", requireAuth, requireAdmin, async (_req, res) => {
-  res.json(await getSection("notifications"));
+config.get("/notifications", async (req, res) => {
+  res.json(await getSection(req.tenant.id, "notifications"));
 });
-config.put("/notifications", requireAuth, requireAdmin, async (req, res) => {
-  await saveSection("notifications", req.body);
+config.put("/notifications", async (req, res) => {
+  await saveSection(req.tenant.id, "notifications", req.body);
   res.json({ ok: true });
 });

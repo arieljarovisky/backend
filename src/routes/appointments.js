@@ -1,4 +1,4 @@
-// src/routes/appointments.js
+// src/routes/appointments.js — MULTI-TENANT
 import { Router } from "express";
 import { pool } from "../db.js";
 import { isAfter, isBefore } from "date-fns";
@@ -56,13 +56,15 @@ function fmtLocal(iso) {
 }
 
 /* ========= Working hours ========= */
-async function getWorkingHoursForDate(stylistId, dateStr, db = pool) {
+async function getWorkingHoursForDate(stylistId, dateStr, db = pool, tenantId) {
   const weekday = new Date(`${dateStr}T00:00:00`).getDay();
   const [rows] = await db.query(
     `SELECT start_time, end_time
        FROM working_hours
-      WHERE stylist_id=? AND weekday=? LIMIT 1`,
-    [stylistId, weekday]
+      WHERE stylist_id=? AND tenant_id=? AND weekday IN (?, ?) 
+      ORDER BY start_time
+      LIMIT 1`,
+    [stylistId, tenantId, weekday, weekday === 0 ? 7 : weekday]
   );
   return rows[0] || null;
 }
@@ -74,12 +76,12 @@ function insideWorkingHours(dateStr, start_time, end_time, start, end) {
 }
 
 /* ========= Servicios / duración ========= */
-async function resolveServiceDuration(serviceId, fallbackDurationMin, db = pool) {
+async function resolveServiceDuration(serviceId, fallbackDurationMin, db = pool, tenantId) {
   try {
     if (serviceId) {
       const [[row]] = await db.query(
-        "SELECT duration_min FROM service WHERE id = ? LIMIT 1",
-        [serviceId]
+        "SELECT duration_min FROM service WHERE id = ? AND tenant_id = ? LIMIT 1",
+        [serviceId, tenantId]
       );
       if (row && row.duration_min != null) return Number(row.duration_min);
     }
@@ -93,15 +95,20 @@ function normPhone(p) {
   return String(p).replace(/[\s-]/g, "");
 }
 
-// ✅ MODIFICADO: Acepta db como parámetro
-async function ensureCustomerId({ name, phone }, db = pool) {
+async function ensureCustomerId({ name, phone }, db = pool, tenantId) {
   const phoneNorm = normPhone(phone);
   if (!phoneNorm) return null;
-  const [rows] = await db.query("SELECT id FROM customer WHERE phone_e164=? LIMIT 1", [phoneNorm]);
+
+  // Por diseño: UNIQUE (tenant_id, phone_e164)
+  const [rows] = await db.query(
+    "SELECT id FROM customer WHERE phone_e164=? AND tenant_id=? LIMIT 1",
+    [phoneNorm, tenantId]
+  );
   if (rows.length) return rows[0].id;
+
   const [ins] = await db.query(
-    "INSERT INTO customer (name, phone_e164) VALUES (?, ?)",
-    [name || null, phoneNorm]
+    "INSERT INTO customer (tenant_id, name, phone_e164) VALUES (?, ?, ?)",
+    [tenantId, name || null, phoneNorm]
   );
   return ins.insertId;
 }
@@ -124,11 +131,13 @@ export async function createAppointment({
   status = "scheduled",
   durationMin = null,
   depositDecimal,
-  markDepositAsPaid = false
+  markDepositAsPaid = false,
+  tenantId // 👈 requerido para multi-tenant si se invoca fuera de rutas HTTP
 }) {
   if (!customerPhone || !stylistId || !serviceId || !startsAt) {
     throw new Error("Faltan campos requeridos");
   }
+  if (!tenantId) throw new Error("Tenant no identificado");
 
   const STATUS = {
     SCHEDULED: "scheduled",
@@ -149,16 +158,16 @@ export async function createAppointment({
   try {
     await conn.beginTransaction();
 
-    // 1) upsert cliente
+    // 1) upsert cliente scoped
     await conn.query(
-      `INSERT INTO customer (name, phone_e164)
-       VALUES (?, ?)
+      `INSERT INTO customer (tenant_id, name, phone_e164)
+       VALUES (?, ?, ?)
        ON DUPLICATE KEY UPDATE name = COALESCE(VALUES(name), name)`,
-      [customerName ?? null, normPhone(customerPhone)]
+      [tenantId, customerName ?? null, normPhone(customerPhone)]
     );
     const [[cust]] = await conn.query(
-      `SELECT id, phone_e164 FROM customer WHERE phone_e164=? LIMIT 1`,
-      [normPhone(customerPhone)]
+      `SELECT id, phone_e164 FROM customer WHERE phone_e164=? AND tenant_id=? LIMIT 1`,
+      [normPhone(customerPhone), tenantId]
     );
 
     // 2) fechas (MySQL)
@@ -166,8 +175,8 @@ export async function createAppointment({
     if (!startMySQL) throw new Error("Fecha/hora inválida");
     let endMySQL = anyToMySQL(endsAt);
     if (!endMySQL) {
-      const dur = await resolveServiceDuration(serviceId, durationMin, conn);
-      if (!dur) throw new Error("No se pudo determinar la duración del servicio");
+      const dur = await resolveServiceDuration(serviceId, durationMin, conn, tenantId);
+      if (dur == null) throw new Error("No se pudo determinar la duración del servicio");
       const [[{ calc_end }]] = await conn.query(
         "SELECT DATE_ADD(STR_TO_DATE(?, '%Y-%m-%d %H:%i:%s'), INTERVAL ? MINUTE) AS calc_end",
         [startMySQL, dur]
@@ -175,10 +184,10 @@ export async function createAppointment({
       endMySQL = anyToMySQL(calc_end);
     }
 
-    // 2.1) precio del servicio (para calcular seña si hace falta)
+    // 2.1) precio del servicio (para seña)
     const [[svc]] = await conn.query(
-      "SELECT price_decimal FROM service WHERE id=? LIMIT 1",
-      [serviceId]
+      "SELECT price_decimal FROM service WHERE id=? AND tenant_id=? LIMIT 1",
+      [serviceId, tenantId]
     );
     if (!svc) throw new Error("Servicio inexistente");
     const price = Number(svc.price_decimal ?? 0);
@@ -194,7 +203,7 @@ export async function createAppointment({
 
     // 3) horario laboral
     const dateStr = startMySQL.slice(0, 10);
-    const wh = await getWorkingHoursForDate(stylistId, dateStr, conn);
+    const wh = await getWorkingHoursForDate(stylistId, dateStr, conn, tenantId);
     if (!wh) throw new Error("El peluquero no tiene horarios definidos para ese día");
 
     const startDate = new Date(startMySQL.replace(" ", "T"));
@@ -204,13 +213,13 @@ export async function createAppointment({
       throw new Error("Fuera del horario laboral");
     }
 
-    // ✅ 4) VALIDAR SOLAPAMIENTO CON LOCK Y USANDO conn
+    // 4) VALIDAR SOLAPAMIENTO (usa conn) — internamente debe chequear por stylist/tenant
     await checkAppointmentOverlap(conn, {
       stylistId: Number(stylistId),
       startTime: startDate,
       endTime: endDate,
       bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0),
-      useLock: true // ✅ CRÍTICO
+      useLock: true
     });
 
     // 5) decidir estado final
@@ -247,14 +256,15 @@ export async function createAppointment({
     // 6) campos de pago
     const depositPaidAt = markDepositAsPaid ? anyToMySQL(new Date()) : null;
 
-    // 7) insert
+    // 7) INSERT con tenant
     const [r] = await conn.query(
       `INSERT INTO appointment
-       (customer_id, stylist_id, service_id,
+       (tenant_id, customer_id, stylist_id, service_id,
         deposit_decimal, starts_at, ends_at,
         status, hold_until, deposit_paid_at, created_at)
-       VALUES (?,?,?,?,?,?, ?, ?, ?, NOW())`,
+       VALUES (?,?,?,?,?,?, ?, ?, ?, ?, NOW())`,
       [
+        tenantId,
         cust.id, Number(stylistId), Number(serviceId),
         Number(depositValue || 0), startMySQL, endMySQL,
         finalStatus, holdUntil, depositPaidAt
@@ -285,6 +295,7 @@ export const appointments = Router();
 
 appointments.get("/", requireAuth, requireRole("admin", "user"), async (req, res) => {
   try {
+    const tenantId = req.tenant.id;
     const { from, to, stylistId } = req.query;
 
     let sql = `
@@ -293,12 +304,12 @@ appointments.get("/", requireAuth, requireRole("admin", "user"), async (req, res
              s.name AS service_name, 
              st.name AS stylist_name
         FROM appointment a
-        JOIN customer c ON c.id = a.customer_id
-        JOIN service s  ON s.id = a.service_id
-        JOIN stylist st ON st.id = a.stylist_id
-       WHERE 1=1
+        JOIN customer c ON c.id = a.customer_id  AND c.tenant_id = a.tenant_id
+        JOIN service  s ON s.id = a.service_id   AND s.tenant_id = a.tenant_id
+        JOIN stylist st ON st.id = a.stylist_id  AND st.tenant_id = a.tenant_id
+       WHERE a.tenant_id = ?
     `;
-    const params = [];
+    const params = [tenantId];
 
     if (from) {
       sql += " AND a.starts_at >= ?";
@@ -323,11 +334,12 @@ appointments.get("/", requireAuth, requireRole("admin", "user"), async (req, res
   }
 });
 
-// ✅ POST corregido con transacción y locks
+// ✅ POST con tenant en todas las consultas
 appointments.post("/", requireRole("admin", "user"), async (req, res) => {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    const tenantId = req.tenant.id;
 
     const {
       stylistId,
@@ -346,7 +358,8 @@ appointments.post("/", requireRole("admin", "user"), async (req, res) => {
     if (!effectiveCustomerId) {
       effectiveCustomerId = await ensureCustomerId(
         { name: customerName, phone: customerPhone, notes: customerNotes },
-        conn // ✅ Usar conn
+        conn,
+        tenantId
       );
     }
 
@@ -360,10 +373,9 @@ appointments.post("/", requireRole("admin", "user"), async (req, res) => {
 
     // --- 2) Obtener servicio ---
     const [[svc]] = await conn.query(
-      "SELECT duration_min FROM service WHERE id=? LIMIT 1",
-      [serviceId]
+      "SELECT duration_min FROM service WHERE id=? AND tenant_id=? LIMIT 1",
+      [serviceId, tenantId]
     );
-    
     if (!svc) {
       await conn.rollback();
       return res.status(400).json({ ok: false, error: "Servicio inexistente" });
@@ -372,7 +384,7 @@ appointments.post("/", requireRole("admin", "user"), async (req, res) => {
     // --- 3) Calcular fechas ---
     const startMySQL = anyToMySQL(startsAt);
     let endMySQL = anyToMySQL(endsAt);
-    
+
     if (!endMySQL) {
       const [[{ calc_end }]] = await conn.query(
         "SELECT DATE_ADD(STR_TO_DATE(?, '%Y-%m-%d %H:%i:%s'), INTERVAL ? MINUTE) AS calc_end",
@@ -384,51 +396,61 @@ appointments.post("/", requireRole("admin", "user"), async (req, res) => {
     const startDate = new Date(startMySQL.replace(" ", "T"));
     const endDate = new Date(endMySQL.replace(" ", "T"));
 
-    // --- 4) ✅ VALIDAR SOLAPAMIENTO CON LOCK ---
+    // --- 4) VALIDAR SOLAPAMIENTO ---
     try {
       await checkAppointmentOverlap(conn, {
         stylistId: Number(stylistId),
         startTime: startDate,
         endTime: endDate,
         bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0),
-        useLock: true // ✅ CRÍTICO
+        useLock: true
       });
     } catch (overlapError) {
       await conn.rollback();
-      return res.status(409).json({ 
-        ok: false, 
-        error: overlapError.message 
+      return res.status(409).json({
+        ok: false,
+        error: overlapError.message
       });
     }
 
-    // --- 5) Insertar turno ---
+    // --- 4.1) Horario laboral del estilista (por tenant) ---
+    const dateStr = startMySQL.slice(0, 10);
+    const wh = await getWorkingHoursForDate(stylistId, dateStr, conn, tenantId);
+    if (!wh) {
+      await conn.rollback();
+      return res.status(400).json({ ok: false, error: "El peluquero no tiene horarios definidos para ese día" });
+    }
+    if (!insideWorkingHours(dateStr, wh.start_time, wh.end_time, startDate, endDate)) {
+      await conn.rollback();
+      return res.status(400).json({ ok: false, error: "Fuera del horario laboral" });
+    }
+
+    // --- 5) Insertar turno con tenant ---
     const [ins] = await conn.query(
       `INSERT INTO appointment 
-       (stylist_id, service_id, customer_id, starts_at, ends_at, status, created_at)
-       VALUES (?, ?, ?, ?, ?, 'scheduled', NOW())`,
-      [stylistId, serviceId, effectiveCustomerId, startMySQL, endMySQL]
+       (tenant_id, stylist_id, service_id, customer_id, starts_at, ends_at, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'scheduled', NOW())`,
+      [tenantId, stylistId, serviceId, effectiveCustomerId, startMySQL, endMySQL]
     );
-
     const appointmentId = ins.insertId;
 
-    // --- 6) Commit ---
     await conn.commit();
     console.log("✅ [appointments POST] Turno creado:", appointmentId);
 
-    // --- 7) Notificaciones (fuera de la transacción) ---
+    // --- 6) Notificaciones (fuera de la transacción) ---
     try {
       let customerLabel = `Cliente #${effectiveCustomerId}`;
       let serviceLabel = `Servicio #${serviceId}`;
 
       const [[c]] = await pool.query(
-        "SELECT COALESCE(name,'') AS name, COALESCE(phone_e164,'') AS phone FROM customer WHERE id=?",
-        [effectiveCustomerId]
+        "SELECT COALESCE(name,'') AS name, COALESCE(phone_e164,'') AS phone FROM customer WHERE id=? AND tenant_id=?",
+        [effectiveCustomerId, tenantId]
       );
       if (c?.name || c?.phone) customerLabel = c.name || c.phone || customerLabel;
 
       const [[s]] = await pool.query(
-        "SELECT COALESCE(name,'') AS name FROM service WHERE id=?",
-        [serviceId]
+        "SELECT COALESCE(name,'') AS name FROM service WHERE id=? AND tenant_id=?",
+        [serviceId, tenantId]
       );
       if (s?.name) serviceLabel = s.name;
 
@@ -437,29 +459,22 @@ appointments.post("/", requireRole("admin", "user"), async (req, res) => {
         type: "appointment",
         title: "Nuevo turno reservado",
         message: `${customerLabel} — ${serviceLabel} — Inicio: ${startsAt}`,
-        data: { appointmentId, stylistId, serviceId, customerId: effectiveCustomerId, startsAt, endsAt: endMySQL }
+        data: { tenantId, appointmentId, stylistId, serviceId, customerId: effectiveCustomerId, startsAt, endsAt: endMySQL }
       });
 
-      // Notificar al estilista si existe
-      const [cols] = await pool.query(`
-        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = DATABASE()
-          AND TABLE_NAME = 'stylist'
-          AND COLUMN_NAME = 'user_id'
-        LIMIT 1
-      `);
-
-      if (cols.length) {
-        const [[sty]] = await pool.query("SELECT user_id FROM stylist WHERE id=? LIMIT 1", [stylistId]);
-        if (sty?.user_id) {
-          await createNotification({
-            userId: sty.user_id,
-            type: "appointment",
-            title: "Te asignaron un nuevo turno",
-            message: `${customerLabel} — ${serviceLabel} — Inicio: ${startsAt}`,
-            data: { appointmentId, stylistId, serviceId, customerId: effectiveCustomerId, startsAt, endsAt: endMySQL }
-          });
-        }
+      // Notificar al estilista si existe mapping user_id
+      const [[sty]] = await pool.query(
+        "SELECT user_id FROM stylist WHERE id=? AND tenant_id=? LIMIT 1",
+        [stylistId, tenantId]
+      );
+      if (sty?.user_id) {
+        await createNotification({
+          userId: sty.user_id,
+          type: "appointment",
+          title: "Te asignaron un nuevo turno",
+          message: `${customerLabel} — ${serviceLabel} — Inicio: ${startsAt}`,
+          data: { tenantId, appointmentId, stylistId, serviceId, customerId: effectiveCustomerId, startsAt, endsAt: endMySQL }
+        });
       }
     } catch (e) {
       console.error("⚠️ [appointments] No se pudo crear notificación:", e.message);
@@ -476,25 +491,27 @@ appointments.post("/", requireRole("admin", "user"), async (req, res) => {
   }
 });
 
-// ✅ PUT corregido con transacción y locks
+// ✅ PUT con tenant en locks/selects/updates
 appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, res) => {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
+    const tenantId = req.tenant.id;
     const { id } = req.params;
     const b = req.body || {};
 
     const depositDecimal = b.depositDecimal ?? null;
     const markDepositAsPaid = b.markDepositAsPaid === true;
 
-    // Turno actual
+    // Turno actual (lock y tenant)
     const [[current]] = await conn.query(
       `SELECT id, customer_id, stylist_id, service_id, starts_at, ends_at, status, deposit_decimal
-         FROM appointment WHERE id=? FOR UPDATE`, // ✅ Agregar FOR UPDATE
-      [id]
+         FROM appointment 
+        WHERE id=? AND tenant_id=? FOR UPDATE`,
+      [id, tenantId]
     );
-    
+
     if (!current) {
       await conn.rollback();
       return res.status(404).json({ ok: false, error: "Turno no encontrado" });
@@ -505,7 +522,7 @@ appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, 
       newCustomerId = await ensureCustomerId({
         name: b.customerName ?? b.customer_name,
         phone: b.customerPhone ?? b.phone_e164
-      }, conn); // ✅ Usar conn
+      }, conn, tenantId);
     }
 
     const stylistId = (b.stylistId ?? b.stylist_id) ?? current.stylist_id;
@@ -533,7 +550,7 @@ appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, 
         Boolean(startMySQL) || Boolean(b.serviceId ?? b.service_id) || durationMin != null;
 
       if (mustRecalc) {
-        const dur = await resolveServiceDuration(serviceId, durationMin, conn);
+        const dur = await resolveServiceDuration(serviceId, durationMin, conn, tenantId);
         if (dur && effectiveStart) {
           const [[{ calc_end }]] = await conn.query(
             "SELECT DATE_ADD(STR_TO_DATE(?, '%Y-%m-%d %H:%i:%s'), INTERVAL ? MINUTE) AS calc_end",
@@ -551,8 +568,8 @@ appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, 
     // Validar horarios y overlaps si cambia rango
     if (startMySQL && endMySQL) {
       const dateStr = startMySQL.slice(0, 10);
-      const wh = await getWorkingHoursForDate(stylistId, dateStr, conn);
-      
+      const wh = await getWorkingHoursForDate(stylistId, dateStr, conn, tenantId);
+
       if (!wh) {
         await conn.rollback();
         return res.status(400).json({ ok: false, error: "El peluquero no tiene horarios definidos para ese día" });
@@ -566,7 +583,6 @@ appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, 
         return res.status(400).json({ ok: false, error: "Fuera del horario laboral" });
       }
 
-      // ✅ Validar overlap con lock
       try {
         await checkAppointmentOverlap(conn, {
           stylistId: Number(stylistId),
@@ -574,7 +590,7 @@ appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, 
           endTime: endDate,
           excludeId: id,
           bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0),
-          useLock: true // ✅ CRÍTICO
+          useLock: true
         });
       } catch (overlapError) {
         await conn.rollback();
@@ -585,8 +601,8 @@ appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, 
     // Validación de seña si viene
     if (depositDecimal != null) {
       const [[svc]] = await conn.query(
-        "SELECT price_decimal FROM service WHERE id=? LIMIT 1",
-        [serviceId]
+        "SELECT price_decimal FROM service WHERE id=? AND tenant_id=? LIMIT 1",
+        [serviceId, tenantId]
       );
       if (!svc) {
         await conn.rollback();
@@ -608,7 +624,7 @@ appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, 
       }
     }
 
-    // UPDATE
+    // UPDATE (scoped)
     let setPaidAtSQL = "";
     const params = [
       newCustomerId,
@@ -618,7 +634,8 @@ appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, 
       endMySQL,
       status,
       depositDecimal,
-      id
+      id,
+      tenantId
     ];
 
     if (markDepositAsPaid) {
@@ -626,16 +643,16 @@ appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, 
     }
 
     const [r] = await conn.query(
-      `UPDATE appointment
-          SET customer_id     = COALESCE(?, customer_id),
-              stylist_id      = COALESCE(?, stylist_id),
-              service_id      = COALESCE(?, service_id),
-              starts_at       = COALESCE(?, starts_at),
-              ends_at         = COALESCE(?, ends_at),
-              status          = COALESCE(?, status),
-              deposit_decimal = COALESCE(?, deposit_decimal)
+      `UPDATE appointment a
+          SET a.customer_id     = COALESCE(?, a.customer_id),
+              a.stylist_id      = COALESCE(?, a.stylist_id),
+              a.service_id      = COALESCE(?, a.service_id),
+              a.starts_at       = COALESCE(?, a.starts_at),
+              a.ends_at         = COALESCE(?, a.ends_at),
+              a.status          = COALESCE(?, a.status),
+              a.deposit_decimal = COALESCE(?, a.deposit_decimal)
               ${setPaidAtSQL}
-        WHERE id = ?`,
+        WHERE a.id = ? AND a.tenant_id = ?`,
       params
     );
 
@@ -657,8 +674,12 @@ appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, 
 
 appointments.delete("/:id", requireAuth, requireRole("admin", "user"), async (req, res) => {
   try {
+    const tenantId = req.tenant.id;
     const { id } = req.params;
-    const [r] = await pool.query(`DELETE FROM appointment WHERE id=?`, [id]);
+    const [r] = await pool.query(
+      `DELETE FROM appointment WHERE id=? AND tenant_id=?`,
+      [id, tenantId]
+    );
 
     if (r.affectedRows === 0) {
       return res.status(404).json({ ok: false, error: "Turno no encontrado" });
@@ -673,11 +694,13 @@ appointments.delete("/:id", requireAuth, requireRole("admin", "user"), async (re
 /* -------- Utilidades -------- */
 const UPCOMING_STATUSES = ["scheduled", "confirmed", "deposit_paid", "pending_deposit"];
 
-export async function listUpcomingAppointmentsByPhone(phone_e164, { limit = 5 } = {}) {
+// Si la usás fuera de rutas, pasá explícito tenantId en opts
+export async function listUpcomingAppointmentsByPhone(phone_e164, { limit = 5, tenantId } = {}) {
   if (!phone_e164) return [];
+  if (!tenantId) throw new Error("Tenant no identificado");
 
-  const phone = normPhone(phone_e164);
-  const params = [phone, ...UPCOMING_STATUSES, Number(limit)];
+  const phone = String(phone_e164).replace(/\D/g, "");
+  const params = [tenantId, phone, ...UPCOMING_STATUSES, Number(limit)];
   const placeholders = UPCOMING_STATUSES.map(() => "?").join(",");
 
   const [rows] = await pool.query(
@@ -686,10 +709,11 @@ export async function listUpcomingAppointmentsByPhone(phone_e164, { limit = 5 } 
            s.name  AS service_name,
            st.name AS stylist_name
       FROM appointment a
-      JOIN customer  c  ON c.id  = a.customer_id
-      JOIN service   s  ON s.id  = a.service_id
-      JOIN stylist   st ON st.id = a.stylist_id
-     WHERE c.phone_e164 = ?
+      JOIN customer  c  ON c.id  = a.customer_id AND c.tenant_id = a.tenant_id
+      JOIN service   s  ON s.id  = a.service_id  AND s.tenant_id = a.tenant_id
+      JOIN stylist   st ON st.id = a.stylist_id AND st.tenant_id = a.tenant_id
+     WHERE a.tenant_id = ?
+       AND c.phone_e164 = ?
        AND a.status IN (${placeholders})
        AND a.starts_at >= NOW()
      ORDER BY a.starts_at ASC

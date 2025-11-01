@@ -16,6 +16,7 @@ mpWebhook.post("/", async (req, res) => {
       body?.data?.id || body?.id || body?.resource?.split?.("/")?.pop?.() || null;
     const status = body?.data?.status || body?.status || null;
     const appointmentIdInBody = body?.appointment_id || null;
+    const fallbackTenantId = Number(process.env.BOT_TENANT_ID || 0);
 
     if (paymentId) {
       await pool.query(
@@ -28,7 +29,7 @@ mpWebhook.post("/", async (req, res) => {
       );
     }
 
-    await processPendingLogs({ onlyPaymentId: paymentId });
+    await processPendingLogs({ onlyPaymentId: paymentId, fallbackTenantId });
     return res.sendStatus(200);
   } catch (e) {
     console.error("[MP Webhook] Error general:", e?.message, e);
@@ -36,7 +37,7 @@ mpWebhook.post("/", async (req, res) => {
   }
 });
 
-async function processPendingLogs({ onlyPaymentId = null } = {}) {
+async function processPendingLogs({ onlyPaymentId = null, fallbackTenantId = 0 } = {}) {
   const where = onlyPaymentId
     ? "WHERE l.payment_id = ? AND l.processed_at IS NULL"
     : "WHERE l.processed_at IS NULL";
@@ -102,20 +103,22 @@ async function processPendingLogs({ onlyPaymentId = null } = {}) {
       }
       console.log(`[MP->PROC] appointment_id=${appointmentId}`);
 
-      // 3) Datos del turno
+
+      // 3) Datos del turno + tenant
       const [[ap]] = await pool.query(
-        `SELECT a.id, a.starts_at, a.status, a.deposit_decimal, a.deposit_paid_at,
-                s.name AS service_name, st.name AS stylist_name,
-                c.phone_e164 AS phone, c.name AS customer_name
-           FROM appointment a
-           JOIN service  s  ON s.id  = a.service_id
-           JOIN stylist  st ON st.id = a.stylist_id
-           JOIN customer c  ON c.id  = a.customer_id
-          WHERE a.id = ?`,
+        `SELECT a.id, a.tenant_id, a.starts_at, a.status, a.deposit_decimal, a.deposit_paid_at,
+              s.name AS service_name, st.name AS stylist_name,
+              c.phone_e164 AS phone, c.name AS customer_name
+         FROM appointment a
+         JOIN service  s  ON s.id  = a.service_id
+         JOIN stylist  st ON st.id = a.stylist_id
+         JOIN customer c  ON c.id  = a.customer_id
+        WHERE a.id = ?`,
         [appointmentId]
       );
       if (!ap) throw new Error(`Turno ${appointmentId} no encontrado.`);
-
+      const tenantId = Number(ap.tenant_id || fallbackTenantId || 0);
+      if (!tenantId) throw new Error("No pude resolver tenant_id para el pago.");
       const wasPending = ap.status === "pending_deposit";
       const hadPaidAt = Boolean(ap.deposit_paid_at);
 
@@ -131,15 +134,15 @@ async function processPendingLogs({ onlyPaymentId = null } = {}) {
 
       await pool.query(
         `INSERT INTO payment
-     (appointment_id, method, amount_cents, currency,
-      gross_amount_cents, fee_cents, net_amount_cents,
-      mp_payment_id, mp_raw_json, created_at)
-   VALUES (?,?,?,?,?,?,?,?,?,NOW())
+    (tenant_id, appointment_id, method, amount_cents, currency,
+     gross_amount_cents, fee_cents, net_amount_cents,
+     mp_payment_id, mp_raw_json, created_at)
+  VALUES (?,?,?,?,?,?,?,?,?,?,NOW())
    ON DUPLICATE KEY UPDATE
-     -- no cambiamos montos si ya existe; solo “tocamos” algo inofensivo
      appointment_id = COALESCE(VALUES(appointment_id), appointment_id)`
         ,
         [
+          tenantId,
           appointmentId,
           'mercadopago',
           amount != null ? Math.round(amount * 100) : null,
@@ -162,8 +165,8 @@ async function processPendingLogs({ onlyPaymentId = null } = {}) {
                 hold_until = NULL,
                 mp_payment_id = COALESCE(mp_payment_id, ?),
                 mp_payment_status = ?
-          WHERE id = ?`,
-        [setStatusTo, amount ?? null, paymentId, (pay?.status || row.status || null), appointmentId]
+          WHERE id = ? AND tenant_id = ?`,
+        [setStatusTo, amount ?? null, paymentId, (pay?.status || row.status || null), appointmentId, tenantId]
       );
 
       // 5) WhatsApp solo si “recién confirmado”

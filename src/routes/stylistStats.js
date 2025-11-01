@@ -19,6 +19,7 @@ stylistStats.get("/:stylistId", async (req, res) => {
     const stylistId = Number(req.params.stylistId);
     const from = String(req.query.from || "").slice(0, 10);
     const to = String(req.query.to || "").slice(0, 10);
+    const tenantId = req.tenant.id;
     if (!stylistId || !from || !to) {
       return res.status(400).json({ ok: false, error: "Falta stylistId/from/to" });
     }
@@ -26,8 +27,8 @@ stylistStats.get("/:stylistId", async (req, res) => {
 
     // % de comisión (si no hay, 0)
     const [[rowPct]] = await pool.query(
-      `SELECT percentage FROM stylist_commission WHERE stylist_id=? LIMIT 1`,
-      [stylistId]
+      `SELECT percentage FROM stylist_commission WHERE tenant_id=? AND stylist_id=? LIMIT 1`,
+      [tenantId, stylistId]
     );
     const porcentaje = Number(rowPct?.percentage || 0);
 
@@ -42,11 +43,11 @@ stylistStats.get("/:stylistId", async (req, res) => {
         COALESCE(SUM(s.price_decimal), 0)           AS monto_total
       FROM appointment a
       JOIN service s ON s.id = a.service_id
-      WHERE a.stylist_id = ?
+       WHERE a.stylist_id = ? AND a.tenant_id = ?
         AND a.status IN (?,?,?,?)
         AND a.starts_at BETWEEN ? AND ?
       `,
-      [stylistId, ...statuses, fromTs, toTs]
+       [stylistId, tenantId, ...statuses, fromTs, toTs]
     );
 
     const monto_total = Number(kpi?.monto_total || 0);
@@ -62,13 +63,13 @@ stylistStats.get("/:stylistId", async (req, res) => {
              COALESCE(SUM(s.price_decimal),0) AS amount
       FROM appointment a
       JOIN service s ON s.id = a.service_id
-      WHERE a.stylist_id = ?
+       WHERE a.stylist_id = ? AND a.tenant_id = ?
         AND a.status IN (?,?,?,?)
         AND a.starts_at BETWEEN ? AND ?
       GROUP BY DATE(a.starts_at)
       ORDER BY DATE(a.starts_at)
       `,
-      [stylistId, ...statuses, fromTs, toTs]
+      [stylistId, tenantId, ...statuses, fromTs, toTs]
     );
 
     // Por servicio
@@ -79,13 +80,13 @@ stylistStats.get("/:stylistId", async (req, res) => {
              COALESCE(SUM(s.price_decimal),0) AS amount
       FROM appointment a
       JOIN service s ON s.id = a.service_id
-      WHERE a.stylist_id = ?
+       WHERE a.stylist_id = ? AND a.tenant_id = ?
         AND a.status IN (?,?,?,?)
         AND a.starts_at BETWEEN ? AND ?
       GROUP BY s.id
       ORDER BY amount DESC
       `,
-      [stylistId, ...statuses, fromTs, toTs]
+      [stylistId, tenantId, ...statuses, fromTs, toTs]
     );
 
     // (Opcional) lista de turnos para exportar
@@ -98,12 +99,12 @@ stylistStats.get("/:stylistId", async (req, res) => {
       JOIN service s  ON s.id = a.service_id
       LEFT JOIN customer c ON c.id = a.customer_id
       JOIN stylist  st ON st.id = a.stylist_id
-      WHERE a.stylist_id = ?
+       WHERE a.stylist_id = ? AND a.tenant_id =
         AND a.status IN (?,?,?,?)
         AND a.starts_at BETWEEN ? AND ?
       ORDER BY a.starts_at
       `,
-      [stylistId, ...statuses, fromTs, toTs]
+       [stylistId, tenantId, ...statuses, fromTs, toTs]
     );
 
     return res.json({

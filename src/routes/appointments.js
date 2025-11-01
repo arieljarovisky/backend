@@ -7,6 +7,7 @@ import { checkAppointmentOverlap } from "../helpers/overlapValidation.js";
 import { requireAuth, requireRole } from "../auth/middlewares.js";
 import { cfgNumber } from "../services/config.js";
 import { createNotification } from "./notifications.js";
+
 /* ================== Helpers de fecha ================== */
 function anyToMySQL(val) {
   if (!val) return null;
@@ -21,18 +22,15 @@ function anyToMySQL(val) {
   if (typeof val === "string") {
     let s = val.trim();
 
-    // "YYYY-MM-DDTHH:MM(:SS)?" -> local (solo reemplazo la T)
     if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(s)) {
       s = s.replace("T", " ");
       return s.length === 16 ? s + ":00" : s.slice(0, 19);
     }
 
-    // "YYYY-MM-DD HH:MM(:SS)?" -> ya está
     if (/^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}(:\d{2})?$/.test(s)) {
       return s.length === 16 ? s + ":00" : s.slice(0, 19);
     }
 
-    // Si trae Z / offset → convertir a local
     if (/[Zz]$/.test(s) || /[+\-]\d{2}:\d{2}$/.test(s)) {
       const d = new Date(s);
       if (!Number.isNaN(d.getTime())) return fmt(d);
@@ -50,8 +48,6 @@ function anyToMySQL(val) {
   return null;
 }
 
-
-
 function fmtLocal(iso) {
   const d = new Date(iso);
   const f = d.toLocaleDateString("es-AR", { weekday: "short", day: "2-digit", month: "2-digit" });
@@ -61,7 +57,7 @@ function fmtLocal(iso) {
 
 /* ========= Working hours ========= */
 async function getWorkingHoursForDate(stylistId, dateStr, db = pool) {
-  const weekday = new Date(`${dateStr}T00:00:00`).getDay(); // 0..6
+  const weekday = new Date(`${dateStr}T00:00:00`).getDay();
   const [rows] = await db.query(
     `SELECT start_time, end_time
        FROM working_hours
@@ -97,12 +93,13 @@ function normPhone(p) {
   return String(p).replace(/[\s-]/g, "");
 }
 
-async function ensureCustomerId({ name, phone }) {
+// ✅ MODIFICADO: Acepta db como parámetro
+async function ensureCustomerId({ name, phone }, db = pool) {
   const phoneNorm = normPhone(phone);
   if (!phoneNorm) return null;
-  const [rows] = await pool.query("SELECT id FROM customer WHERE phone_e164=? LIMIT 1", [phoneNorm]);
+  const [rows] = await db.query("SELECT id FROM customer WHERE phone_e164=? LIMIT 1", [phoneNorm]);
   if (rows.length) return rows[0].id;
-  const [ins] = await pool.query(
+  const [ins] = await db.query(
     "INSERT INTO customer (name, phone_e164) VALUES (?, ?)",
     [name || null, phoneNorm]
   );
@@ -126,7 +123,7 @@ export async function createAppointment({
   endsAt = null,
   status = "scheduled",
   durationMin = null,
-  depositDecimal,            // si no viene, calculamos con la config
+  depositDecimal,
   markDepositAsPaid = false
 }) {
   if (!customerPhone || !stylistId || !serviceId || !startsAt) {
@@ -144,7 +141,7 @@ export async function createAppointment({
   const ALLOWED = new Set(Object.values(STATUS));
   const normalizeStatus = (s) => {
     const t = String(s || "").toLowerCase().trim();
-    if (t === "deposit_pending") return STATUS.PENDING; // alias viejo
+    if (t === "deposit_pending") return STATUS.PENDING;
     return ALLOWED.has(t) ? t : STATUS.SCHEDULED;
   };
 
@@ -189,9 +186,7 @@ export async function createAppointment({
     // 2.2) % de seña desde config (default 50)
     const depositPct = await cfgNumber("deposit.percentage", 50);
 
-    // 2.3) decidir monto de seña:
-    // - si viene depositDecimal: se respeta (0 => sin seña)
-    // - si NO viene: se calcula con el % guardado
+    // 2.3) decidir monto de seña
     const depositValue =
       depositDecimal == null
         ? Math.round(price * (depositPct / 100))
@@ -209,12 +204,13 @@ export async function createAppointment({
       throw new Error("Fuera del horario laboral");
     }
 
-    // 4) solapamientos
-    await checkAppointmentOverlap(pool, {
+    // ✅ 4) VALIDAR SOLAPAMIENTO CON LOCK Y USANDO conn
+    await checkAppointmentOverlap(conn, {
       stylistId: Number(stylistId),
       startTime: startDate,
       endTime: endDate,
-      bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0)
+      bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0),
+      useLock: true // ✅ CRÍTICO
     });
 
     // 5) decidir estado final
@@ -286,6 +282,7 @@ export async function createAppointment({
 
 /* ========= Router ========= */
 export const appointments = Router();
+
 appointments.get("/", requireAuth, requireRole("admin", "user"), async (req, res) => {
   try {
     const { from, to, stylistId } = req.query;
@@ -326,138 +323,180 @@ appointments.get("/", requireAuth, requireRole("admin", "user"), async (req, res
   }
 });
 
-  appointments.post("/", requireRole("admin", "user"), async (req, res) => {
-    try {
-      const {
-        stylistId,
-        serviceId,
-        customerId,         // puede venir o no
-        customerName,       // para autogenerar
-        customerPhone,      // para autogenerar
-        customerNotes,      // opcional
-        startsAt,
-        endsAt              // puede venir null, según tu flujo
-      } = req.body;
+// ✅ POST corregido con transacción y locks
+appointments.post("/", requireRole("admin", "user"), async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
 
-      // --- 1) Asegurar cliente ---
-      let effectiveCustomerId = customerId || null;
+    const {
+      stylistId,
+      serviceId,
+      customerId,
+      customerName,
+      customerPhone,
+      customerNotes,
+      startsAt,
+      endsAt
+    } = req.body;
 
-      if (!effectiveCustomerId) {
-        effectiveCustomerId = await ensureCustomerId(
-          { name: customerName, phone: customerPhone, notes: customerNotes },
-          pool
-        );
-      }
+    // --- 1) Asegurar cliente ---
+    let effectiveCustomerId = customerId || null;
 
-      if (!effectiveCustomerId) {
-        return res.status(400).json({
-          ok: false,
-          error: "No se pudo determinar/crear el cliente (faltan datos)"
-        });
-      }
-
-      // --- 2) Insertar turno ---
-      const [[svc]] = await pool.query("SELECT duration_min FROM service WHERE id=? LIMIT 1", [serviceId]);
-      if (!svc) return res.status(400).json({ ok: false, error: "Servicio inexistente" });
-      const [ins] = await pool.query(
-        `INSERT INTO appointment (stylist_id, service_id, customer_id, starts_at, ends_at, status, created_at)
-    VALUES (?, ?, ?, ?, DATE_ADD(?, INTERVAL ? MINUTE), 'scheduled', NOW())`,
-        [stylistId, serviceId, effectiveCustomerId, startsAt, startsAt, svc.duration_min]
+    if (!effectiveCustomerId) {
+      effectiveCustomerId = await ensureCustomerId(
+        { name: customerName, phone: customerPhone, notes: customerNotes },
+        conn // ✅ Usar conn
       );
-      const appointmentId = ins.insertId;
-      console.log("🧾 [appointments] creado apptId:", appointmentId, "stylistId:", stylistId, "customerId:", effectiveCustomerId);
+    }
 
-      // --- 3) Etiquetas legibles (opcional) ---
+    if (!effectiveCustomerId) {
+      await conn.rollback();
+      return res.status(400).json({
+        ok: false,
+        error: "No se pudo determinar/crear el cliente (faltan datos)"
+      });
+    }
+
+    // --- 2) Obtener servicio ---
+    const [[svc]] = await conn.query(
+      "SELECT duration_min FROM service WHERE id=? LIMIT 1",
+      [serviceId]
+    );
+    
+    if (!svc) {
+      await conn.rollback();
+      return res.status(400).json({ ok: false, error: "Servicio inexistente" });
+    }
+
+    // --- 3) Calcular fechas ---
+    const startMySQL = anyToMySQL(startsAt);
+    let endMySQL = anyToMySQL(endsAt);
+    
+    if (!endMySQL) {
+      const [[{ calc_end }]] = await conn.query(
+        "SELECT DATE_ADD(STR_TO_DATE(?, '%Y-%m-%d %H:%i:%s'), INTERVAL ? MINUTE) AS calc_end",
+        [startMySQL, svc.duration_min]
+      );
+      endMySQL = anyToMySQL(calc_end);
+    }
+
+    const startDate = new Date(startMySQL.replace(" ", "T"));
+    const endDate = new Date(endMySQL.replace(" ", "T"));
+
+    // --- 4) ✅ VALIDAR SOLAPAMIENTO CON LOCK ---
+    try {
+      await checkAppointmentOverlap(conn, {
+        stylistId: Number(stylistId),
+        startTime: startDate,
+        endTime: endDate,
+        bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0),
+        useLock: true // ✅ CRÍTICO
+      });
+    } catch (overlapError) {
+      await conn.rollback();
+      return res.status(409).json({ 
+        ok: false, 
+        error: overlapError.message 
+      });
+    }
+
+    // --- 5) Insertar turno ---
+    const [ins] = await conn.query(
+      `INSERT INTO appointment 
+       (stylist_id, service_id, customer_id, starts_at, ends_at, status, created_at)
+       VALUES (?, ?, ?, ?, ?, 'scheduled', NOW())`,
+      [stylistId, serviceId, effectiveCustomerId, startMySQL, endMySQL]
+    );
+
+    const appointmentId = ins.insertId;
+
+    // --- 6) Commit ---
+    await conn.commit();
+    console.log("✅ [appointments POST] Turno creado:", appointmentId);
+
+    // --- 7) Notificaciones (fuera de la transacción) ---
+    try {
       let customerLabel = `Cliente #${effectiveCustomerId}`;
       let serviceLabel = `Servicio #${serviceId}`;
-      try {
-        const [[c]] = await pool.query(
-          "SELECT COALESCE(name,'') AS name, COALESCE(phone_e164,'') AS phone FROM customer WHERE id=?",
-          [effectiveCustomerId]
-        );
-        if (c?.name || c?.phone) customerLabel = c.name || c.phone || customerLabel;
 
-        const [[s]] = await pool.query(
-          "SELECT COALESCE(name,'') AS name FROM service WHERE id=?",
-          [serviceId]
-        );
-        if (s?.name) serviceLabel = s.name;
-      } catch (e) {
-        console.warn("ℹ️ [appointments] No pude enriquecer labels:", e.message);
-      }
+      const [[c]] = await pool.query(
+        "SELECT COALESCE(name,'') AS name, COALESCE(phone_e164,'') AS phone FROM customer WHERE id=?",
+        [effectiveCustomerId]
+      );
+      if (c?.name || c?.phone) customerLabel = c.name || c.phone || customerLabel;
 
-      // --- 4) Notificación para el usuario autenticado (campanita) ---
-      try {
-        await createNotification({
-          userId: req.user.id,
-          type: "appointment",
-          title: "Nuevo turno reservado",
-          message: `${customerLabel} — ${serviceLabel} — Inicio: ${startsAt}`,
-          data: { appointmentId, stylistId, serviceId, customerId: effectiveCustomerId, startsAt, endsAt }
-        });
-        console.log("🔔 [appointments] Notificación (admin/user) creada:", { userId: req.user.id, appointmentId });
-      } catch (e) {
-        console.error("⚠️ [appointments] No se pudo crear notificación (admin/user):", e.message);
-      }
+      const [[s]] = await pool.query(
+        "SELECT COALESCE(name,'') AS name FROM service WHERE id=?",
+        [serviceId]
+      );
+      if (s?.name) serviceLabel = s.name;
 
-      // --- 5) (Opcional) Notificar al estilista si existe la columna user_id ---
-      try {
-        const [cols] = await pool.query(`
-          SELECT 1
-          FROM INFORMATION_SCHEMA.COLUMNS
-          WHERE TABLE_SCHEMA = DATABASE()
-            AND TABLE_NAME = 'stylist'
-            AND COLUMN_NAME = 'user_id'
-          LIMIT 1
-        `);
+      await createNotification({
+        userId: req.user.id,
+        type: "appointment",
+        title: "Nuevo turno reservado",
+        message: `${customerLabel} — ${serviceLabel} — Inicio: ${startsAt}`,
+        data: { appointmentId, stylistId, serviceId, customerId: effectiveCustomerId, startsAt, endsAt: endMySQL }
+      });
 
-        if (cols.length) {
-          const [[sty]] = await pool.query("SELECT user_id FROM stylist WHERE id=? LIMIT 1", [stylistId]);
-          if (sty?.user_id) {
-            await createNotification({
-              userId: sty.user_id,
-              type: "appointment",
-              title: "Te asignaron un nuevo turno",
-              message: `${customerLabel} — ${serviceLabel} — Inicio: ${startsAt}`,
-              data: { appointmentId, stylistId, serviceId, customerId: effectiveCustomerId, startsAt, endsAt }
-            });
-            console.log("🔔 [appointments] Notificación (estilista) creada:", { userId: sty.user_id, appointmentId });
-          } else {
-            console.log("ℹ️ [appointments] Estilista sin user_id — no se notifica.");
-          }
-        } else {
-          console.log("ℹ️ [appointments] 'stylist.user_id' no existe en este entorno — salto notificación a estilista.");
+      // Notificar al estilista si existe
+      const [cols] = await pool.query(`
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'stylist'
+          AND COLUMN_NAME = 'user_id'
+        LIMIT 1
+      `);
+
+      if (cols.length) {
+        const [[sty]] = await pool.query("SELECT user_id FROM stylist WHERE id=? LIMIT 1", [stylistId]);
+        if (sty?.user_id) {
+          await createNotification({
+            userId: sty.user_id,
+            type: "appointment",
+            title: "Te asignaron un nuevo turno",
+            message: `${customerLabel} — ${serviceLabel} — Inicio: ${startsAt}`,
+            data: { appointmentId, stylistId, serviceId, customerId: effectiveCustomerId, startsAt, endsAt: endMySQL }
+          });
         }
-      } catch (e) {
-        console.error("⚠️ [appointments] No se pudo notificar estilista:", e.message);
       }
-
-      // --- 6) Responder ---
-      return res.status(201).json({ ok: true, id: appointmentId });
-
-    } catch (err) {
-      console.error("❌ [appointments POST] ERROR:", err);
-      return res.status(500).json({ ok: false, error: "No se pudo crear el turno" });
+    } catch (e) {
+      console.error("⚠️ [appointments] No se pudo crear notificación:", e.message);
     }
-  });
 
-/* -------- PUT /api/appointments/:id -------- */
+    return res.status(201).json({ ok: true, id: appointmentId });
+
+  } catch (err) {
+    await conn.rollback();
+    console.error("❌ [appointments POST] ERROR:", err);
+    return res.status(500).json({ ok: false, error: "No se pudo crear el turno" });
+  } finally {
+    conn.release();
+  }
+});
+
+// ✅ PUT corregido con transacción y locks
 appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, res) => {
+  const conn = await pool.getConnection();
   try {
+    await conn.beginTransaction();
+
     const { id } = req.params;
     const b = req.body || {};
 
-    // seña y marca de pago
     const depositDecimal = b.depositDecimal ?? null;
     const markDepositAsPaid = b.markDepositAsPaid === true;
 
     // Turno actual
-    const [[current]] = await pool.query(
+    const [[current]] = await conn.query(
       `SELECT id, customer_id, stylist_id, service_id, starts_at, ends_at, status, deposit_decimal
-         FROM appointment WHERE id=? LIMIT 1`,
+         FROM appointment WHERE id=? FOR UPDATE`, // ✅ Agregar FOR UPDATE
       [id]
     );
+    
     if (!current) {
+      await conn.rollback();
       return res.status(404).json({ ok: false, error: "Turno no encontrado" });
     }
 
@@ -466,10 +505,9 @@ appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, 
       newCustomerId = await ensureCustomerId({
         name: b.customerName ?? b.customer_name,
         phone: b.customerPhone ?? b.phone_e164
-      });
+      }, conn); // ✅ Usar conn
     }
 
-    // Si no me mandan, uso los actuales
     const stylistId = (b.stylistId ?? b.stylist_id) ?? current.stylist_id;
     const serviceId = (b.serviceId ?? b.service_id) ?? current.service_id;
     const status = b.status ?? null;
@@ -483,6 +521,7 @@ appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, 
       try {
         validateAppointmentDate(startMySQL);
       } catch (validationError) {
+        await conn.rollback();
         return res.status(400).json({ ok: false, error: validationError.message });
       }
     }
@@ -494,9 +533,9 @@ appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, 
         Boolean(startMySQL) || Boolean(b.serviceId ?? b.service_id) || durationMin != null;
 
       if (mustRecalc) {
-        const dur = await resolveServiceDuration(serviceId, durationMin);
+        const dur = await resolveServiceDuration(serviceId, durationMin, conn);
         if (dur && effectiveStart) {
-          const [[{ calc_end }]] = await pool.query(
+          const [[{ calc_end }]] = await conn.query(
             "SELECT DATE_ADD(STR_TO_DATE(?, '%Y-%m-%d %H:%i:%s'), INTERVAL ? MINUTE) AS calc_end",
             [anyToMySQL(effectiveStart), Number(dur)]
           );
@@ -512,8 +551,10 @@ appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, 
     // Validar horarios y overlaps si cambia rango
     if (startMySQL && endMySQL) {
       const dateStr = startMySQL.slice(0, 10);
-      const wh = await getWorkingHoursForDate(stylistId, dateStr);
+      const wh = await getWorkingHoursForDate(stylistId, dateStr, conn);
+      
       if (!wh) {
+        await conn.rollback();
         return res.status(400).json({ ok: false, error: "El peluquero no tiene horarios definidos para ese día" });
       }
 
@@ -521,34 +562,48 @@ appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, 
       const endDate = new Date(endMySQL.replace(" ", "T"));
 
       if (!insideWorkingHours(dateStr, wh.start_time, wh.end_time, startDate, endDate)) {
+        await conn.rollback();
         return res.status(400).json({ ok: false, error: "Fuera del horario laboral" });
       }
 
+      // ✅ Validar overlap con lock
       try {
-        await checkAppointmentOverlap(pool, {
+        await checkAppointmentOverlap(conn, {
           stylistId: Number(stylistId),
           startTime: startDate,
           endTime: endDate,
           excludeId: id,
-          bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0)
+          bufferMinutes: Number(process.env.APPT_BUFFER_MIN || 0),
+          useLock: true // ✅ CRÍTICO
         });
       } catch (overlapError) {
+        await conn.rollback();
         return res.status(409).json({ ok: false, error: overlapError.message });
       }
     }
 
     // Validación de seña si viene
     if (depositDecimal != null) {
-      const [[svc]] = await pool.query(
+      const [[svc]] = await conn.query(
         "SELECT price_decimal FROM service WHERE id=? LIMIT 1",
         [serviceId]
       );
-      if (!svc) return res.status(400).json({ ok: false, error: "Servicio inexistente" });
+      if (!svc) {
+        await conn.rollback();
+        return res.status(400).json({ ok: false, error: "Servicio inexistente" });
+      }
       const price = Number(svc.price_decimal ?? 0);
       const dep = Number(depositDecimal);
-      if (Number.isNaN(dep)) return res.status(400).json({ ok: false, error: "Seña inválida" });
-      if (dep < 0) return res.status(400).json({ ok: false, error: "La seña no puede ser negativa" });
+      if (Number.isNaN(dep)) {
+        await conn.rollback();
+        return res.status(400).json({ ok: false, error: "Seña inválida" });
+      }
+      if (dep < 0) {
+        await conn.rollback();
+        return res.status(400).json({ ok: false, error: "La seña no puede ser negativa" });
+      }
       if (price > 0 && dep > price) {
+        await conn.rollback();
         return res.status(400).json({ ok: false, error: "La seña no puede superar el precio del servicio" });
       }
     }
@@ -570,7 +625,7 @@ appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, 
       setPaidAtSQL = ", deposit_paid_at = NOW()";
     }
 
-    const [r] = await pool.query(
+    const [r] = await conn.query(
       `UPDATE appointment
           SET customer_id     = COALESCE(?, customer_id),
               stylist_id      = COALESCE(?, stylist_id),
@@ -585,20 +640,24 @@ appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, 
     );
 
     if (r.affectedRows === 0) {
+      await conn.rollback();
       return res.status(404).json({ ok: false, error: "Turno no encontrado" });
     }
 
+    await conn.commit();
     res.json({ ok: true });
   } catch (e) {
+    await conn.rollback();
+    console.error("❌ [PUT /appointments/:id] ERROR:", e);
     res.status(500).json({ ok: false, error: e.message });
+  } finally {
+    conn.release();
   }
 });
 
-/* -------- DELETE /api/appointments/:id -------- */
 appointments.delete("/:id", requireAuth, requireRole("admin", "user"), async (req, res) => {
   try {
     const { id } = req.params;
-
     const [r] = await pool.query(`DELETE FROM appointment WHERE id=?`, [id]);
 
     if (r.affectedRows === 0) {
@@ -612,7 +671,6 @@ appointments.delete("/:id", requireAuth, requireRole("admin", "user"), async (re
 });
 
 /* -------- Utilidades -------- */
-// Estados “futuros” válidos (excluye cancelados y completados)
 const UPCOMING_STATUSES = ["scheduled", "confirmed", "deposit_paid", "pending_deposit"];
 
 export async function listUpcomingAppointmentsByPhone(phone_e164, { limit = 5 } = {}) {

@@ -25,49 +25,57 @@ export function parseDateTime(s) {
  * - db: pool o conn (ambos tienen .query)
  * - useLock: true si estás dentro de BEGIN con `conn` para hacer FOR UPDATE (evita carreras).
  */
+// src/helpers/overlapValidation.js
 export async function checkAppointmentOverlap(db, {
   stylistId,
-  startTime,     // Date
-  endTime,       // Date
+  startTime,
+  endTime,
   bufferMinutes = 0,
   excludeId = null,
-  useLock = true
+  useLock = true // ✅ Por defecto true
 }) {
   if (!stylistId || !startTime || !endTime) {
     throw new Error("Parámetros insuficientes para validar solape");
   }
 
   const startWithBuffer = addMinutes(startTime, -Number(bufferMinutes || 0));
-  const endWithBuffer   = addMinutes(endTime,  Number(bufferMinutes || 0));
+  const endWithBuffer = addMinutes(endTime, Number(bufferMinutes || 0));
 
   const startStr = toMySQLDateTime(startWithBuffer);
-  const endStr   = toMySQLDateTime(endWithBuffer);
+  const endStr = toMySQLDateTime(endWithBuffer);
 
-  // 🚀 IGNORAMOS CANCELADOS (y otros que no bloqueen horario)
+  // ✅ IGNORAMOS CANCELADOS
   let sqlAppt = `
     SELECT id
-      FROM appointment
-     WHERE stylist_id = ?
-       AND starts_at < ?
-       AND ends_at   > ?
-       AND status IN ('scheduled','confirmed','deposit_paid','completed','pending_deposit')
+    FROM appointment
+    WHERE stylist_id = ?
+      AND starts_at < ?
+      AND ends_at > ?
+      AND status IN ('scheduled','confirmed','deposit_paid','completed','pending_deposit')
   `;
 
   const params = [Number(stylistId), endStr, startStr];
-  if (excludeId) { sqlAppt += " AND id <> ?"; params.push(Number(excludeId)); }
-  if (useLock)   { sqlAppt += " FOR UPDATE"; }
+  if (excludeId) {
+    sqlAppt += " AND id <> ?";
+    params.push(Number(excludeId));
+  }
+  if (useLock) {
+    sqlAppt += " FOR UPDATE"; // ✅ CRÍTICO: bloquea las filas
+  }
 
   const [appts] = await db.query(sqlAppt, params);
 
   let sqlOff = `
     SELECT id
-      FROM time_off
-     WHERE stylist_id = ?
-       AND starts_at < ?
-       AND ends_at   > ?
+    FROM time_off
+    WHERE stylist_id = ?
+      AND starts_at < ?
+      AND ends_at > ?
   `;
   const paramsOff = [Number(stylistId), endStr, startStr];
-  if (useLock) { sqlOff += " FOR UPDATE"; }
+  if (useLock) {
+    sqlOff += " FOR UPDATE";
+  }
 
   const [offs] = await db.query(sqlOff, paramsOff);
 

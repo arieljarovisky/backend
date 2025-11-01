@@ -357,12 +357,13 @@ appointments.post("/", requireRole("admin", "user"), async (req, res) => {
     }
 
     // --- 2) Insertar turno ---
+    const [[svc]] = await pool.query("SELECT duration_min FROM service WHERE id=? LIMIT 1", [serviceId]);
+    if (!svc) return res.status(400).json({ ok: false, error: "Servicio inexistente" });
     const [ins] = await pool.query(
       `INSERT INTO appointment (stylist_id, service_id, customer_id, starts_at, ends_at, status, created_at)
-       VALUES (?, ?, ?, ?, ?, 'scheduled', NOW())`,
-      [stylistId, serviceId, effectiveCustomerId, startsAt, endsAt || null]
+   VALUES (?, ?, ?, ?, DATE_ADD(?, INTERVAL ? MINUTE), 'scheduled', NOW())`,
+      [stylistId, serviceId, effectiveCustomerId, startsAt, startsAt, svc.duration_min]
     );
-
     const appointmentId = ins.insertId;
     console.log("🧾 [appointments] creado apptId:", appointmentId, "stylistId:", stylistId, "customerId:", effectiveCustomerId);
 

@@ -31,6 +31,19 @@ import { daysOff } from "./routes/daysOff.js";
 dotenv.config();
 const app = express();
 
+
+// LOG GLOBAL DE TODAS LAS REQUESTS (incluye OPTIONS)
+app.use((req, res, next) => {
+    const auth = req.headers.authorization || "";
+    const shortAuth = auth ? auth.slice(0, 16) + "…" : "(none)";
+    console.log(
+        `[REQ] ${new Date().toISOString()} ${req.method} ${req.originalUrl} ` +
+        `origin=${req.headers.origin || "(none)"} auth=${shortAuth}`
+    );
+    next();
+});
+
+
 // ────── Middlewares globales ──────
 
 const ALLOWED_ORIGINS = [
@@ -71,7 +84,7 @@ app.use("/api/commissions", stylistCommission);
 app.use("/api/stats", stylistStats);
 app.use("/api", requireAuth, notifications);
 app.use("/api/working-hours", workingHours);
-app.use("/api/days-off", daysOff); 
+app.use("/api/days-off", daysOff);
 
 
 // ────── API Admin (ORDEN CORREGIDO) ──────

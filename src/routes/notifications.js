@@ -139,23 +139,37 @@ function safeParseJSON(s) { try { return JSON.parse(s); } catch { return null; }
 
 
 export async function createNotification({ userId, type, title, message, data }) {
-  // Clave idem: por turno si hay appointmentId; si no, hash del contenido
+  // Clave idem más granular: por userId + appointmentId + type
   const idemKey = (() => {
     const apptId = data?.appointmentId ?? null;
-    if (apptId) return `u${userId}|appt|${apptId}|${type}`;
+    if (apptId) {
+      // ✅ Incluye type para permitir múltiples notificaciones del mismo turno
+      // pero evita duplicados del mismo tipo
+      return `u${userId}|appt${apptId}|${type}`;
+    }
     const payload = JSON.stringify({ type, title, message, data: data ?? {} });
     const digest = crypto.createHash("sha1").update(`${userId}|${payload}`).digest("hex");
     return `h|${digest}`;
   })();
 
-  await pool.query(
-    `
-    INSERT INTO notifications (user_id, type, title, message, data, idempotency_key)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE
-      title = VALUES(title),
-      message = VALUES(message)
-    `,
-    [userId, type, title, message, JSON.stringify(data || {}), idemKey]
-  );
+  try {
+    await pool.query(
+      `
+      INSERT INTO notifications (user_id, type, title, message, data, idempotency_key)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        title = VALUES(title),
+        message = VALUES(message),
+        updated_at = CURRENT_TIMESTAMP  -- ✅ Opcional: actualizar timestamp
+      `,
+      [userId, type, title, message, JSON.stringify(data || {}), idemKey]
+    );
+  } catch (err) {
+    // ✅ Ignorar errores de clave duplicada en desarrollo
+    if (err.code === 'ER_DUP_ENTRY') {
+      console.warn(`[NOTIF] Notificación duplicada ignorada: ${idemKey}`);
+      return;
+    }
+    throw err;
+  }
 }

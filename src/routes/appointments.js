@@ -6,7 +6,7 @@ import { validateAppointmentDate } from "../helpers/dateValidation.js";
 import { checkAppointmentOverlap } from "../helpers/overlapValidation.js";
 import { requireAuth, requireRole } from "../auth/middlewares.js";
 import { cfgNumber } from "../services/config.js";
-
+import { createNotification } from "./notifications.js";
 /* ================== Helpers de fecha ================== */
 function anyToMySQL(val) {
   if (!val) return null;
@@ -341,44 +341,43 @@ appointments.get("/", requireAuth, async (req, res) => {
 });
 
 /* -------- POST /api/appointments -------- */
-appointments.post("/", requireAuth, requireRole("admin","user"), async (req, res) =>  {
+appointments.post("/", requireAuth, requireRole("admin", "user"), async (req, res) => {
   try {
-    const {
-      customerName, customerPhone,
-      stylistId, serviceId,
-      startsAt, endsAt,
-      status = "scheduled",
-      durationMin,
-      depositDecimal,           // si no viene => se calcula con config
-      markDepositAsPaid = false
-    } = req.body || {};
-
-    // Validación básica
-    if (!customerPhone || !stylistId || !serviceId || !startsAt) {
-      return res.status(400).json({ ok: false, error: "Faltan campos requeridos" });
-    }
-
-    const result = await createAppointment({
-      customerPhone,
-      customerName,
-      stylistId,
-      serviceId,
-      startsAt,
-      endsAt,
-      status,
-      durationMin,
-      depositDecimal,           // ⬅️ no forzar 0
-      markDepositAsPaid: Boolean(markDepositAsPaid)
+    await createNotification({
+      userId: req.user.id,
+      type: "appointment",
+      title: "Nuevo turno reservado",
+      message: `Cliente: ${customerName || customerPhone} — Servicio #${serviceId} — Inicio: ${startsAt}`,
+      data: { appointmentId: result.id, stylistId, serviceId, startsAt }
     });
-
-    return res.status(201).json(result);
+    console.log("🔔 [appointments] Notificación creada para user:", req.user.id, "appt:", result.id);
   } catch (e) {
-    return res.status(400).json({ ok: false, error: e.message });
+    console.error("⚠️ [appointments] No se pudo crear notificación (admin):", e.message);
+  }
+
+  // (Opcional) Notificar al estilista si tiene user asignado
+  try {
+    const [[styUser]] = await pool.query(
+      "SELECT user_id FROM stylist WHERE id=? LIMIT 1",
+      [stylistId]
+    );
+    if (styUser?.user_id) {
+      await createNotification({
+        userId: styUser.user_id,
+        type: "appointment",
+        title: "Te asignaron un nuevo turno",
+        message: `Cliente: ${customerName || customerPhone} — Servicio #${serviceId} — Inicio: ${startsAt}`,
+        data: { appointmentId: result.id, stylistId, serviceId, startsAt }
+      });
+      console.log("🔔 [appointments] Notificación creada para estilista.user_id:", styUser.user_id);
+    }
+  } catch (e) {
+    console.error("⚠️ [appointments] No se pudo notificar estilista:", e.message);
   }
 });
 
 /* -------- PUT /api/appointments/:id -------- */
-appointments.put("/:id", requireAuth, requireRole("admin","user"), async (req, res) => {
+appointments.put("/:id", requireAuth, requireRole("admin", "user"), async (req, res) => {
   try {
     const { id } = req.params;
     const b = req.body || {};
@@ -531,7 +530,7 @@ appointments.put("/:id", requireAuth, requireRole("admin","user"), async (req, r
 });
 
 /* -------- DELETE /api/appointments/:id -------- */
-appointments.delete("/:id", requireAuth, requireRole("admin","user"), async (req, res) => {
+appointments.delete("/:id", requireAuth, requireRole("admin", "user"), async (req, res) => {
   try {
     const { id } = req.params;
 

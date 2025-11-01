@@ -1,16 +1,15 @@
 // src/routes/notifications.js
 import { Router } from "express";
 import { pool } from "../db.js";
-import { requireAuth, requireRole } from "../auth/middlewares.js";
+import { requireRole } from "../auth/middlewares.js";
 
 export const notifications = Router();
 
-// GET /api/notifications
-notifications.get("/notifications", requireAuth, async (req, res) => {
+/** LISTAR (usa auth del router montado en index.js) */
+notifications.get("/notifications", async (req, res) => {
   try {
     const { unreadOnly } = req.query;
     const userId = req.user.id;
-
     const sql = `
       SELECT id, user_id, type, title, message, data, is_read, created_at
       FROM notifications
@@ -20,13 +19,9 @@ notifications.get("/notifications", requireAuth, async (req, res) => {
       LIMIT 50
     `;
     const [rows] = await pool.query(sql, [userId]);
-
     res.json({
       ok: true,
-      data: rows.map(r => ({
-        ...r,
-        data: r.data ? safeParseJSON(r.data) : null,
-      })),
+      data: rows.map(r => ({ ...r, data: r.data ? safeParseJSON(r.data) : null })),
     });
   } catch (error) {
     console.error("❌ [GET /notifications] Error:", error);
@@ -34,22 +29,24 @@ notifications.get("/notifications", requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/notifications/count
-notifications.get("/notifications/count", requireAuth, async (req, res) => {
+/** CONTAR (con logs para ver que corre) */
+notifications.get("/notifications/count", async (req, res) => {
   try {
+    console.log("📫 [/notifications/count] userId:", req.user?.id);
     const [rows] = await pool.query(
       "SELECT COUNT(*) AS count FROM notifications WHERE user_id = ? AND is_read = 0",
       [req.user.id]
     );
+    console.log("📫 [/notifications/count] rows:", rows);
     res.json({ ok: true, count: rows[0]?.count || 0 });
   } catch (error) {
-    console.error("❌ [GET /notifications/count] Error:", error);
+    console.error("❌ [/notifications/count] Error:", error.code, error.sqlMessage || error.message);
     res.status(500).json({ error: "Error al contar notificaciones" });
   }
 });
 
-// PUT /api/notifications/:id/read
-notifications.put("/notifications/:id/read", requireAuth, async (req, res) => {
+/** MARCAR LEÍDA */
+notifications.put("/notifications/:id/read", async (req, res) => {
   try {
     const { id } = req.params;
     await pool.query(
@@ -63,8 +60,8 @@ notifications.put("/notifications/:id/read", requireAuth, async (req, res) => {
   }
 });
 
-// PUT /api/notifications/read-all
-notifications.put("/notifications/read-all", requireAuth, async (req, res) => {
+/** MARCAR TODAS LEÍDAS */
+notifications.put("/notifications/read-all", async (req, res) => {
   try {
     await pool.query(
       "UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0",
@@ -77,8 +74,8 @@ notifications.put("/notifications/read-all", requireAuth, async (req, res) => {
   }
 });
 
-// DELETE /api/notifications/:id
-notifications.delete("/notifications/:id", requireAuth, async (req, res) => {
+/** BORRAR */
+notifications.delete("/notifications/:id", async (req, res) => {
   try {
     const { id } = req.params;
     await pool.query(
@@ -92,31 +89,29 @@ notifications.delete("/notifications/:id", requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/notifications/test (solo admin)
-notifications.post("/notifications/test", requireRole("admin"), async (req, res) => {
+/** CREAR (endpoint real) */
+notifications.post("/notifications", async (req, res) => {
   try {
     const { userId, type, title, message, data = null } = req.body;
-    const targetUserId = userId || req.user.id; // fallback
-    console.log("🧪 [/notifications/test] payload:", { targetUserId, type, title });
+    const targetUserId = userId || req.user.id;
+    console.log("📝 [/notifications] create payload:", { targetUserId, type, title });
 
     const [result] = await pool.query(
       `INSERT INTO notifications (user_id, type, title, message, data, is_read)
        VALUES (?, ?, ?, ?, ?, 0)`,
       [targetUserId, type, title, message, data ? JSON.stringify(data) : null]
     );
-    console.log("🧪 [/notifications/test] insertId:", result?.insertId);
+    console.log("📝 [/notifications] insertId:", result?.insertId);
     res.json({ ok: true, id: result?.insertId ?? null });
   } catch (error) {
-    console.error("❌ [/notifications/test] Error:", error.code, error.sqlMessage || error.message);
-    res.status(500).json({ error: "Error al crear notificación" });
+    console.error("❌ [/notifications] create Error:", error.code, error.sqlMessage || error.message);
+    res.status(500).json({ ok: false, error: "Error al crear notificación" });
   }
 });
 
-function safeParseJSON(s) {
-  try { return JSON.parse(s); } catch { return null; }
-}
+function safeParseJSON(s) { try { return JSON.parse(s); } catch { return null; } }
 
-// Si querés exponer helpers:
+// Helper (lo dejás igual)
 export async function createNotification({ userId, type, title, message, data = null }) {
   try {
     await pool.query(
@@ -126,18 +121,5 @@ export async function createNotification({ userId, type, title, message, data = 
     );
   } catch (error) {
     console.error("❌ [createNotification] Error:", error);
-  }
-}
-
-export async function notifyAdmins({ type, title, message, data = null }) {
-  try {
-    const [admins] = await pool.query(
-      'SELECT id FROM users WHERE role IN ("admin", "user")'
-    );
-    for (const admin of admins) {
-      await createNotification({ userId: admin.id, type, title, message, data });
-    }
-  } catch (error) {
-    console.error("❌ [notifyAdmins] Error:", error);
   }
 }

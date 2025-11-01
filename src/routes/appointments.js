@@ -286,6 +286,45 @@ export async function createAppointment({
 
 /* ========= Router ========= */
 export const appointments = Router();
+appointments.get("/", requireAuth, requireRole("admin", "user"), async (req, res) => {
+  try {
+    const { from, to, stylistId } = req.query;
+
+    let sql = `
+      SELECT a.*, 
+             c.name AS customer_name, 
+             s.name AS service_name, 
+             st.name AS stylist_name
+        FROM appointment a
+        JOIN customer c ON c.id = a.customer_id
+        JOIN service s  ON s.id = a.service_id
+        JOIN stylist st ON st.id = a.stylist_id
+       WHERE 1=1
+    `;
+    const params = [];
+
+    if (from) {
+      sql += " AND a.starts_at >= ?";
+      params.push(from);
+    }
+    if (to) {
+      sql += " AND a.starts_at <= ?";
+      params.push(to);
+    }
+    if (stylistId) {
+      sql += " AND a.stylist_id = ?";
+      params.push(stylistId);
+    }
+
+    sql += " ORDER BY a.starts_at ASC";
+
+    const [rows] = await pool.query(sql, params);
+    res.json(rows);
+  } catch (err) {
+    console.error("❌ [GET /appointments] ERROR:", err);
+    res.status(500).json({ ok: false, error: "Error al listar turnos" });
+  }
+});
 
 appointments.post("/", requireRole("admin", "user"), async (req, res) => {
   try {

@@ -96,14 +96,18 @@ notifications.delete("/notifications/:id", requireAuth, async (req, res) => {
 notifications.post("/notifications/test", requireRole("admin"), async (req, res) => {
   try {
     const { userId, type, title, message, data = null } = req.body;
-    await pool.query(
+    const targetUserId = userId || req.user.id; // fallback
+    console.log("🧪 [/notifications/test] payload:", { targetUserId, type, title });
+
+    const [result] = await pool.query(
       `INSERT INTO notifications (user_id, type, title, message, data, is_read)
        VALUES (?, ?, ?, ?, ?, 0)`,
-      [userId, type, title, message, data ? JSON.stringify(data) : null]
+      [targetUserId, type, title, message, data ? JSON.stringify(data) : null]
     );
-    res.json({ ok: true });
+    console.log("🧪 [/notifications/test] insertId:", result?.insertId);
+    res.json({ ok: true, id: result?.insertId ?? null });
   } catch (error) {
-    console.error("❌ [POST /notifications/test] Error:", error);
+    console.error("❌ [/notifications/test] Error:", error.code, error.sqlMessage || error.message);
     res.status(500).json({ error: "Error al crear notificación" });
   }
 });
